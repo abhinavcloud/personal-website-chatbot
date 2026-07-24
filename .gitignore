@@ -5,6 +5,8 @@ session**
 *bkp*.py
 *test*.py
 terraform.tfvars
+.venv
+
 
 
 
