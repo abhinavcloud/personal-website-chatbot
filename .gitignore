@@ -1,0 +1,10 @@
+backend.hcl
+.env
+sessions
+session**
+*bkp*.py
+*test*.py
+terraform.tfvars
+
+
+

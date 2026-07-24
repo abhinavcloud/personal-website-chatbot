@@ -1,0 +1,17 @@
+# Amazon Bedrock 101 Demo Requirements
+# Install with: pip install -r requirements.txt
+
+# AWS SDK for Python (Boto3)
+boto3>=1.35.0
+
+# AWS SDK Core
+botocore>=1.35.0
+
+# Optional: Load environment variables from .env file
+python-dotenv>=1.0.0
+
+# Strands Agents SDK (for v3 capstone example)
+# Requires Python 3.10+
+strands-agents>=0.1.0
+strands-agents-tools>=0.1.0
+opencv-python
