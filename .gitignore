@@ -10,6 +10,7 @@ terraform.tfvars
 .terraform.lock.hcl
 code/lambda_kb_processing/bkp/
 code/bedrock_strands_framework/bkp/
+code/bkp/
 check_kb_doc_status.txt
 response.json
 function.zip
