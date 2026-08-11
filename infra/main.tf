@@ -369,15 +369,15 @@ resource "aws_s3vectors_index" "kb_s3_vector_index_personal_website" {
   metadata_configuration {
     non_filterable_metadata_keys = [
       "content",
-      "body",
-      "_page_content",
       "full_text",
       "chunk_text",
-      "preview",
-      "s3_uri",
-      "content_hash",
-      "original_key",
-      "source",
+      "long_meta",
+      "body",
+      "_page_content",
+      "raw_html",
+      "AMAZON_BEDROCK_TEXT",
+      "AMAZON_BEDROCK_METADATA",
+      "AMAZON_BEDROCK_EMBEDDING",    
     ]
   }
 }
@@ -492,6 +492,7 @@ resource "aws_bedrockagent_data_source" "bedrock_data_source_personal_website_1"
     type = "S3"
     s3_configuration {
       bucket_arn = aws_s3_bucket.bedrock_s3bucket_staging.arn
+      inclusion_prefixes = ["bedrock-clean/"]
     }
 
   }
@@ -605,6 +606,31 @@ resource "aws_iam_role_policy_attachment" "lambda_s3_access_attach" {
   policy_arn = aws_iam_policy.lambda_s3_access_source_dest_bucket.arn
 }
 
+# Lambda role polcy attachment for S3 vector database access
+
+data "aws_iam_policy_document" "lambda_s3vectors_getindex" {
+  statement {
+    sid    = "AllowGetS3VectorIndex"
+    effect = "Allow"
+    actions = [
+      "s3vectors:GetIndex",
+    ]
+    resources = [
+      "arn:aws:s3vectors:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:bucket/${aws_s3vectors_vector_bucket.kb_s3_vector_personal_website.vector_bucket_name}/index/${aws_s3vectors_index.kb_s3_vector_index_personal_website.index_name}",
+    ]
+  }
+}
+
+resource "aws_iam_policy" "lambda_s3vectors_getindex" {
+  name   = "lambda-bedrock-s3vectors-getindex-personal-website"
+  policy = data.aws_iam_policy_document.lambda_s3vectors_getindex.json
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_s3vectors_getindex" {
+  role       = aws_iam_role.lambda_execution_role_personal_website.name   
+  policy_arn = aws_iam_policy.lambda_s3vectors_getindex.arn
+}
+
 
 # Package the Lambda function code
 data "archive_file" "lambda_bedrock_invocation_code_personal_website" {
@@ -649,12 +675,12 @@ resource "aws_lambda_function" "lambda_bedrock_function_personal_website" {
       FRONTEND_BUCKET         = var.frontend_bucket_name
       STAGING_BUCKET          = "${aws_s3_bucket.bedrock_s3bucket_staging.bucket}"
       STAGING_PREFIX          = "bedrock-clean"
-      QUARANTINE_PREFIX       = "bedrock-clean/quarnatine"
-      MAX_CHUNK_BYTES         = "1000"
-      VALIDATION_SAMPLE_LIMIT = "20"
+      QUARANTINE_PREFIX       = "quarantine"
+      MAX_CHUNK_BYTES         = "1800"
       DRY_RUN                 = "false"
-      CHUNK_OVERLAP_BYTES = "150"
-
+      CHUNK_OVERLAP_BYTES     = "200"
+      VECTOR_BUCKET_NAME   = "${aws_s3vectors_vector_bucket.kb_s3_vector_personal_website.vector_bucket_name}"
+      VECTOR_INDEX_NAME  = "${aws_s3vectors_index.kb_s3_vector_index_personal_website.index_name}"
     }
   }
 

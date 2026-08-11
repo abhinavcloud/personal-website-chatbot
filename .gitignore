@@ -6,6 +6,15 @@ session**
 *test*.py
 terraform.tfvars
 .venv
+.terraform
+.terraform.lock.hcl
+code/lambda_kb_processing/bkp/
+code/bedrock_strands_framework/bkp/
+check_kb_doc_status.txt
+response.json
+function.zip
+
+
 
 
 

@@ -1,715 +1,789 @@
 #!/usr/bin/env python3
+# app.py
 """
-app.py
+Lambda preprocessing for Bedrock Knowledge Base ingestion into an
+Amazon S3 Vectors-backed vector store.
 
-Lambda entrypoint that:
-- Reads source files from a frontend S3 bucket (or local directory when run locally)
-- Sanitizes text to alphanumeric lowercase (configurable)
-- Chunks large documents into safe-sized pieces by UTF-8 byte length (default 1500 bytes)
-  with a configurable byte overlap between consecutive chunks so context isn't lost at
-  chunk boundaries.
-- Uploads chunked .txt files to a staging S3 prefix with empty S3 object metadata
-  (HTTP headers) -- NOT the same thing as Bedrock KB metadata, see below.
-- Writes a Bedrock Knowledge Base metadata sidecar (`<key>.metadata.json`) next to every
-  chunk, carrying `source_type` (resume/project/blog), `doc_id`, `chunk_index`, and
-  `total_chunks`. This is what lets the Strands retrieval layer filter deterministically
-  instead of relying on vector similarity + prompt instructions to keep resume/project/
-  blog content apart.
-- Starts a Bedrock Agent ingestion job for the configured Knowledge Base / Data Source
+Pipeline: read source docs from FRONTEND_BUCKET -> extract text -> extract
+title/published_date -> chunk -> sanitize -> validate -> write chunk +
+sidecar metadata files to STAGING_BUCKET -> trigger a Bedrock ingestion job.
 
-Key behavior changes vs prior version:
-- Chunking is done by UTF-8 byte size (not characters) to guarantee S3 Vectors 2048-byte
-  filterable metadata limit is not exceeded, WITH overlap between consecutive chunks.
-- Chunk names preserve the original source key and include a chunk index for traceability.
-- Every chunk gets a `<key>.metadata.json` sidecar with Bedrock KB `metadataAttributes`
-  (source_type / doc_id / chunk_index / total_chunks). This sidecar format is intentional
-  and expected -- the old validation step that aborted ingestion on ANY `.meta.json`
-  sidecar has been replaced with a check that the sidecars are well-formed and paired
-  1:1 with chunk objects (previously that check was also looking at the wrong suffix:
-  `.meta.json` instead of the `.metadata.json` suffix Bedrock actually expects).
-- S3 object metadata (HTTP `Metadata={}` header) is still kept empty on the chunk .txt
-  objects themselves -- Bedrock KB metadata lives in the sidecar JSON file, not in S3
-  object headers, so these are orthogonal and both are handled correctly here.
+=====================================================================
+DESIGN NOTES -- read this before changing chunking or metadata logic
+=====================================================================
 
-Environment variables (required):
-  FRONTEND_BUCKET      - source bucket containing website files
-  STAGING_BUCKET       - destination staging bucket for bedrock ingestion
-  STAGING_PREFIX       - destination prefix (default: bedrock-clean)
-  QUARANTINE_PREFIX    - prefix for quarantine copies (default: <STAGING_PREFIX>/quarantine)
-  KNOWLEDGE_BASE_ID    - Bedrock Agent Knowledge Base ID
-  DATA_SOURCE_ID       - Bedrock Agent Data Source ID
-  REGION               - AWS region (optional; falls back to AWS_REGION)
-  MAX_CHUNK_BYTES      - max bytes per chunk (default: 1500)
-  CHUNK_OVERLAP_BYTES  - bytes of overlap between consecutive chunks (default: 150)
-  VALIDATION_SAMPLE_LIMIT - sample limit for validations (default: 20)
-  DRY_RUN              - if "true", do not upload or start ingestion (default: "false")
-  LOG_LEVEL            - logging level (default: INFO)
+1. S3 VECTORS FILTERABLE METADATA IS A HARD 2048-BYTE TOTAL, PER VECTOR,
+   NOT PER FIELD. By default every metadata key on a vector is filterable,
+   including two keys Bedrock injects automatically during ingestion:
+   AMAZON_BEDROCK_TEXT (the chunk text itself) and AMAZON_BEDROCK_METADATA.
+   Which keys are exempt from that 2KB budget is decided ONCE, at S3 Vector
+   Index creation, via Terraform's
+   `metadata_configuration.non_filterable_metadata_keys` -- and it is
+   IMMUTABLE afterward. This Lambda writes exactly one non-filterable key
+   (LONG_META_KEY, default "long_meta") and verifies at runtime that the
+   real index actually declares it (and ideally the AMAZON_BEDROCK_* keys)
+   non-filterable, before uploading or ingesting anything. Your Terraform
+   MUST include, at minimum:
+
+     resource "aws_s3vectors_index" "this" {
+       ...
+       metadata_configuration {
+         non_filterable_metadata_keys = [
+           "long_meta",
+           "AMAZON_BEDROCK_TEXT",
+           "AMAZON_BEDROCK_METADATA",
+         ]
+       }
+     }
+
+2. PDFS ARE BINARY. Decoding raw PDF bytes as UTF-8 does not extract text --
+   it produces mostly control-character noise that sanitization strips
+   down to near-nothing. PDFs are parsed properly here with pdfminer.six
+   (attach it as a Lambda layer).
+
+3. CHUNK PACKING RESERVES OVERLAP + SEPARATOR HEADROOM DURING ACCUMULATION,
+   not after. Two compounding bugs were found and fixed here:
+     a) _CONTROL_RE previously stripped \t and \n as "control characters",
+        silently collapsing every multi-paragraph document into a single
+        unsplittable line before chunking ever ran.
+     b) The overlap step joins `tail + "\n" + content`. If content is
+        packed up to exactly (max_bytes - overlap_bytes), then
+        tail(overlap_bytes) + "\n"(1 byte) + content is 1 byte OVER
+        max_bytes, which the final safety-net split then turns into a real
+        chunk plus a stray 1-byte remainder -- on nearly every chunk.
+   Both are fixed: _CONTROL_RE preserves \t/\n, and the accumulation budget
+   reserves overlap_bytes + 1 (for the separator) up front.
+
+4. TITLE AND PUBLISHED_DATE are extracted per document (once, not per
+   chunk) and stored as small filterable metadata:
+     - title: frontmatter `title:` field if present, else the first
+       markdown H1 (`# ...`) heading, else a humanized version of the
+       filename slug.
+     - published_date: frontmatter `date:` field (YYYY-MM-DD) if present,
+       else the S3 object's LastModified date.
+   Any frontmatter block found is stripped from the content before
+   chunking, so it doesn't pollute chunk text. Both fields are tiny
+   (well under the filterable metadata budget) and exist specifically so
+   downstream retrieval can sort/filter by real recency instead of relying
+   on vector-similarity ranking or letting the LLM guess.
+
+5. RE-RUNNING INGESTION COSTS REAL EMBEDDING-MODEL MONEY. This file:
+   - verifies the real S3 Vectors index config before any upload (fails
+     closed, for free, on drift or misconfiguration)
+   - validates every chunk's metadata size and content length BEFORE
+     upload, quarantining anything that would fail, instead of finding out
+     from a paid ingestion job
+   - supports VALIDATE_ONLY to dry-run the whole pipeline for free
+   - refuses to start a paid ingestion job if anything was quarantined
+     (ABORT_ON_ANY_QUARANTINE, default true)
+   - cleans up a document's previously-written chunks before writing its
+     new set, so a re-chunk that produces fewer/different chunks doesn't
+     leave stale ones permanently indexed
+
+IAM permissions this Lambda's execution role needs:
+  - s3:GetObject, s3:ListBucket on FRONTEND_BUCKET
+  - s3:PutObject, s3:DeleteObject, s3:DeleteObjectTagging, s3:ListBucket on
+    STAGING_BUCKET
+  - s3vectors:GetIndex on the vector index (for the config self-check)
+  - bedrock:StartIngestionJob, bedrock:ListIngestionJobs on the KB/data
+    source
+
+IMPORTANT: make sure your aws_bedrockagent_data_source Terraform sets
+`inclusion_prefixes` on the S3 data source config to STAGING_PREFIX only
+(e.g. ["bedrock-clean/"]). Without it, the data source scans the ENTIRE
+staging bucket, which will pick up QUARANTINE_PREFIX debug artifacts (or
+anything else in the bucket) as if they were real documents. Keep
+QUARANTINE_PREFIX as a sibling of STAGING_PREFIX, not nested under it, as
+defense in depth on top of the inclusion_prefixes scoping.
+=====================================================================
 """
-from __future__ import annotations
+
 import os
 import re
+import io
 import json
 import uuid
-import unicodedata
 import logging
-from typing import List, Iterator, Tuple, Optional, Dict, NamedTuple
-from pathlib import Path
-from pdfminer.high_level import extract_text
+import hashlib
+import unicodedata
+from typing import Any, Dict, List, Optional, Tuple, Iterator
 
 import boto3
 from botocore.exceptions import ClientError
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+try:
+    from pdfminer.high_level import extract_text as _pdfminer_extract_text
+    _PDFMINER_AVAILABLE = True
+except ImportError:
+    _PDFMINER_AVAILABLE = False
+
+# ---------- Logging ----------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logger = logging.getLogger()
 logger.setLevel(LOG_LEVEL)
 
-# ---------------------------------------------------------------------------
-# Env vars and defaults
-# ---------------------------------------------------------------------------
+# ---------- Required environment ----------
 KNOWLEDGE_BASE_ID = os.environ.get("KNOWLEDGE_BASE_ID")
 DATA_SOURCE_ID = os.environ.get("DATA_SOURCE_ID")
-REGION = os.environ.get("REGION", os.environ.get("AWS_REGION"))
+REGION = os.environ.get("REGION", os.environ.get("AWS_REGION", "ap-south-1"))
 FRONTEND_BUCKET = os.environ.get("FRONTEND_BUCKET")
 STAGING_BUCKET = os.environ.get("STAGING_BUCKET")
-STAGING_PREFIX = os.environ.get("STAGING_PREFIX")
-QUARANTINE_PREFIX = os.environ.get("QUARANTINE_PREFIX")
-MAX_CHUNK_BYTES = int(os.environ.get("MAX_CHUNK_BYTES", "1500"))
-CHUNK_OVERLAP_BYTES = int(os.environ.get("CHUNK_OVERLAP_BYTES", "150"))
-VALIDATION_SAMPLE_LIMIT = int(os.environ.get("VALIDATION_SAMPLE_LIMIT", "20"))
-DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
+STAGING_PREFIX = os.environ.get("STAGING_PREFIX", "bedrock-clean")
+QUARANTINE_PREFIX = os.environ.get("QUARANTINE_PREFIX", "bedrock-quarantine")
 
-# ---------------------------------------------------------------------------
-# Boto3 clients
-# ---------------------------------------------------------------------------
+# Must match your aws_s3vectors_index / aws_s3vectors_vector_bucket Terraform resources.
+VECTOR_BUCKET_NAME = os.environ.get("VECTOR_BUCKET_NAME")
+VECTOR_INDEX_NAME = os.environ.get("VECTOR_INDEX_NAME")
+
+# ---------- Chunking ----------
+MAX_CHUNK_BYTES = int(os.environ.get("MAX_CHUNK_BYTES", "1800"))
+CHUNK_OVERLAP_BYTES = int(os.environ.get("CHUNK_OVERLAP_BYTES", "200"))
+
+# 0 or unset = unlimited. Set this (with VALIDATE_ONLY=true) to smoke-test
+# a handful of chunks for free before running the whole corpus.
+VALIDATION_SAMPLE_LIMIT = int(os.environ.get("VALIDATION_SAMPLE_LIMIT", "0"))
+
+# ---------- Metadata safety budgets (margin under documented S3 Vectors caps) ----------
+FILTERABLE_METADATA_SAFE_BYTES = int(os.environ.get("FILTERABLE_METADATA_SAFE_BYTES", "1536"))
+NONFILTERABLE_METADATA_SAFE_BYTES = int(os.environ.get("NONFILTERABLE_METADATA_SAFE_BYTES", "8000"))
+SIDECAR_FILE_MAX_BYTES = int(os.environ.get("SIDECAR_FILE_MAX_BYTES", "9500"))  # Bedrock's sidecar file cap is 10KB
+EXCERPT_MAX_BYTES = int(os.environ.get("EXCERPT_MAX_BYTES", "300"))
+TITLE_MAX_BYTES = int(os.environ.get("TITLE_MAX_BYTES", "200"))
+
+# A chunk/document with fewer than this many non-whitespace characters after
+# normalization is almost certainly a failed extraction, not real content.
+MIN_CONTENT_CHARS = int(os.environ.get("MIN_CONTENT_CHARS", "20"))
+
+# The one non-filterable key this Lambda writes -- MUST be declared in the
+# index's non_filterable_metadata_keys (verified at runtime, not assumed).
+LONG_META_KEY = os.environ.get("LONG_META_KEY", "long_meta")
+REQUIRED_NON_FILTERABLE_KEYS = {LONG_META_KEY}
+BEDROCK_RESERVED_KEYS = {"AMAZON_BEDROCK_TEXT", "AMAZON_BEDROCK_METADATA", "AMAZON_BEDROCK_EMBEDDING"}
+
+# ---------- Run mode ----------
+VALIDATE_ONLY = os.environ.get("VALIDATE_ONLY", "false").lower() == "true"
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true" or VALIDATE_ONLY
+ABORT_ON_ANY_QUARANTINE = os.environ.get("ABORT_ON_ANY_QUARANTINE", "true").lower() == "true"
+CLEANUP_STALE_CHUNKS = os.environ.get("CLEANUP_STALE_CHUNKS", "true").lower() == "true"
+
+# ---------- AWS clients ----------
 s3 = boto3.client("s3")
 bedrock_agent = boto3.client("bedrock-agent", region_name=REGION)
+s3vectors = boto3.client("s3vectors", region_name=REGION)  # requires a boto3 version that supports this service
 
-ACTIVE_STATUSES = {"STARTING", "IN_PROGRESS"}
+# ---------- Sanitizers ----------
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001F5FF" "\U0001F600-\U0001F64F" "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F77F" "\U0001F780-\U0001F7FF" "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF" "\U0001FA00-\U0001FA6F"
+    "\U00002700-\U000027BF" "\U00002600-\U000026FF"
+    "]+", flags=re.UNICODE
+)
+# Strips genuine control characters, but explicitly excludes \t (0x09) and
+# \n (0x0A) -- those are legitimate structural whitespace, not noise.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]+")
+_ALLOWED_RE = re.compile(r"[^A-Za-z0-9 \t\n\.,;:!?\-—()\"'/%\[\]{}@#&+*=<>|`~]+")
 
-# Maps a source prefix under the frontend bucket to the Bedrock KB metadata
-# `source_type` value we want attached to every chunk pulled from it. This is
-# the single source of truth for the resume/project/blog distinction -- add
-# new sources here and metadata + filtering downstream pick it up automatically.
-SOURCE_TYPE_BY_PREFIX: Dict[str, str] = {
+# ---------- Title / date extraction ----------
+_FRONTMATTER_RE = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*\r?\n?", re.DOTALL)
+_FRONTMATTER_DATE_RE = re.compile(r"(?im)^date\s*:\s*['\"]?(\d{4}-\d{2}-\d{2})['\"]?\s*$")
+_FRONTMATTER_TITLE_RE = re.compile(r"(?im)^title\s*:\s*['\"]?([^'\"\n]+?)['\"]?\s*$")
+_H1_RE = re.compile(r"(?m)^#\s+(.+)$")
+
+
+def _short_hash(s: str, length: int = 12) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:length]
+
+
+def _truncate_to_bytes(s: str, max_bytes: int) -> str:
+    if s is None:
+        return ""
+    b = s.encode("utf-8")
+    if len(b) <= max_bytes:
+        return s
+    return b[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    s = unicodedata.normalize("NFKC", text)
+    s = re.sub(r"```.*?```", " ", s, flags=re.DOTALL)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"!\[.*?\]\(.*?\)", " ", s)
+    s = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", s)
+    s = _EMOJI_RE.sub("", s)
+    s = _CONTROL_RE.sub(" ", s)
+    s = _ALLOWED_RE.sub(" ", s)
+    s = re.sub(r"https?://\S+", "[url]", s)
+    # Collapse horizontal whitespace only -- preserve newlines so
+    # semantic_chunks() has real paragraph/line boundaries to split on.
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = s.strip()
+    return s
+
+
+def sanitize_for_metadata(value: Any, max_bytes: int) -> str:
+    if value is None:
+        return ""
+    s = str(value)
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r"```.*?```", " ", s, flags=re.DOTALL)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"!\[.*?\]\(.*?\)", " ", s)
+    s = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", s)
+    s = _EMOJI_RE.sub("", s)
+    s = _CONTROL_RE.sub(" ", s)
+    s = re.sub(r"https?://\S+", "[url]", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return _truncate_to_bytes(s, max_bytes)
+
+
+def extract_title_and_date(key: str, raw_text: str, last_modified) -> Tuple[str, str, str, bool]:
+    """
+    Returns (title, published_date, content_with_frontmatter_stripped, date_from_frontmatter).
+
+    title: frontmatter `title:` -> first markdown H1 heading -> humanized
+    filename slug (in that priority order).
+    published_date: frontmatter `date:` (YYYY-MM-DD) -> S3 object's
+    LastModified date (in that priority order). Empty string if neither
+    is available. date_from_frontmatter is False when the LastModified
+    fallback was used -- worth tracking since LastModified is only a
+    reliable proxy for publish date if your deploy pipeline doesn't
+    re-touch every file on every deploy.
+    """
+    text = raw_text
+    frontmatter_date = None
+    frontmatter_title = None
+
+    fm_match = _FRONTMATTER_RE.match(text)
+    if fm_match:
+        fm_block = fm_match.group(1)
+        date_match = _FRONTMATTER_DATE_RE.search(fm_block)
+        if date_match:
+            frontmatter_date = date_match.group(1)
+        title_match = _FRONTMATTER_TITLE_RE.search(fm_block)
+        if title_match:
+            frontmatter_title = title_match.group(1).strip()
+        text = text[fm_match.end():]  # strip frontmatter out of the content that gets chunked
+
+    title = frontmatter_title
+    if not title:
+        h1_match = _H1_RE.search(text)
+        if h1_match:
+            title = h1_match.group(1).strip()
+    if not title:
+        base = key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        title = re.sub(r"[-_]+", " ", base).strip().title()
+
+    published_date = frontmatter_date
+    if not published_date and last_modified is not None:
+        try:
+            published_date = last_modified.date().isoformat()
+            logger.warning(
+                "%s has no frontmatter 'date:' field -- falling back to S3 LastModified (%s). "
+                "If your deploy pipeline re-uploads/syncs the whole folder on every deploy, this "
+                "date reflects last-deploy-time, not true publish date, and recency sorting on it "
+                "will be unreliable. Add an explicit 'date: YYYY-MM-DD' frontmatter field to this "
+                "file for an accurate date.",
+                key, published_date,
+            )
+        except Exception:
+            published_date = ""
+    if not published_date:
+        published_date = ""
+
+    return (
+        sanitize_for_metadata(title, TITLE_MAX_BYTES),
+        sanitize_for_metadata(published_date, 20),
+        text,
+        frontmatter_date is not None,
+    )
+
+
+# ---------- Text extraction ----------
+def extract_text_from_source(key: str, body: bytes) -> str:
+    """PDFs need real parsing; everything else is treated as plain text."""
+    if key.lower().endswith(".pdf"):
+        if not _PDFMINER_AVAILABLE:
+            logger.error("pdfminer.six not importable -- attach it as a Lambda layer. Falling back to raw decode for %s.", key)
+            return body.decode("utf-8", errors="replace")
+        try:
+            return _pdfminer_extract_text(io.BytesIO(body)) or ""
+        except Exception:
+            logger.exception("pdfminer failed to parse %s; treating as empty", key)
+            return ""
+    return body.decode("utf-8", errors="replace")
+
+
+# ---------- Chunking ----------
+def split_by_bytes(text: str, max_bytes: int, reserve: int = 0) -> List[str]:
+    effective_max = max(1, max_bytes - reserve)
+    b = text.encode("utf-8")
+    parts: List[str] = []
+    start = 0
+    while start < len(b):
+        end = min(start + effective_max, len(b))
+        parts.append(b[start:end].decode("utf-8", errors="ignore"))
+        start = end
+    return parts
+
+
+def semantic_chunks(text: str, max_bytes: int, overlap_bytes: int) -> List[str]:
+    """
+    Packs paragraphs up to (max_bytes - overlap_bytes - 1), then prepends
+    an overlap tail from the previous chunk joined by "\n". The -1 reserves
+    room for that joining newline -- without it, a full-size content chunk
+    plus a full tail plus the separator is exactly 1 byte over max_bytes,
+    which the final safety-net split then turns into a real chunk plus a
+    stray 1-byte remainder on nearly every chunk. Confirmed via
+    reproduction; do not remove the -1.
+    """
+    if not text:
+        return []
+    effective_max = max(1, max_bytes - overlap_bytes - (1 if overlap_bytes > 0 else 0))
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    chunks: List[str] = []
+    cur: List[str] = []
+    cur_bytes = 0
+
+    def flush():
+        nonlocal cur, cur_bytes
+        if cur:
+            combined = "\n".join(cur)
+            if len(combined.encode("utf-8")) <= effective_max:
+                chunks.append(combined)
+            else:
+                chunks.extend(split_by_bytes(combined, effective_max, reserve=0))
+            cur = []
+            cur_bytes = 0
+
+    for p in paragraphs:
+        p_bytes = len(p.encode("utf-8"))
+        if p_bytes > effective_max:
+            flush()
+            chunks.extend(split_by_bytes(p, effective_max, reserve=0))
+            continue
+        if cur_bytes + p_bytes + 1 > effective_max:
+            flush()
+        cur.append(p)
+        cur_bytes += p_bytes + 1
+    flush()
+
+    if overlap_bytes > 0 and len(chunks) > 1:
+        overlapped: List[str] = []
+        for i, c in enumerate(chunks):
+            if i == 0:
+                overlapped.append(c)
+                continue
+            prev = overlapped[-1]
+            tail = prev.encode("utf-8")[-overlap_bytes:].decode("utf-8", errors="ignore")
+            overlapped.append(tail + "\n" + c)
+        chunks = overlapped
+
+    out: List[str] = []
+    for c in chunks:
+        if len(c.encode("utf-8")) <= max_bytes:
+            out.append(c)
+        else:
+            out.extend(split_by_bytes(c, max_bytes, reserve=0))
+    return out
+
+
+# =====================================================================
+# INDEX SELF-CHECK -- run before touching S3 or Bedrock, every invocation.
+# =====================================================================
+def verify_index_metadata_config() -> Tuple[bool, str, set]:
+    if not VECTOR_BUCKET_NAME or not VECTOR_INDEX_NAME:
+        return False, "VECTOR_BUCKET_NAME / VECTOR_INDEX_NAME env vars not set; cannot verify index config", set()
+    try:
+        resp = s3vectors.get_index(vectorBucketName=VECTOR_BUCKET_NAME, indexName=VECTOR_INDEX_NAME)
+    except ClientError as e:
+        return False, f"get_index call failed: {e}", set()
+    except Exception as e:
+        return False, f"Unexpected error calling get_index (check boto3 version supports s3vectors): {e}", set()
+
+    metadata_cfg = resp.get("index", resp).get("metadataConfiguration", {}) or {}
+    actual_non_filterable = set(metadata_cfg.get("nonFilterableMetadataKeys", []) or [])
+
+    missing = REQUIRED_NON_FILTERABLE_KEYS - actual_non_filterable
+    if missing:
+        return False, (
+            f"Index '{VECTOR_INDEX_NAME}' does NOT declare {sorted(missing)} as non-filterable. "
+            f"Filterable metadata is capped at 2048 bytes TOTAL and this is immutable after index "
+            f"creation -- fix Terraform and recreate the index, or every chunk will fail."
+        ), actual_non_filterable
+
+    bedrock_missing = BEDROCK_RESERVED_KEYS - actual_non_filterable
+    if bedrock_missing:
+        logger.warning(
+            "Index does not declare Bedrock-reserved keys %s as non-filterable. Bedrock injects "
+            "these on every chunk during ingestion; ingestion will fail with the same 2048-byte "
+            "error even though this Lambda's own metadata is fine.",
+            sorted(bedrock_missing),
+        )
+
+    return True, "Index metadata configuration OK", actual_non_filterable
+
+
+# ---------- Metadata builders ----------
+def build_filterable_attrs(
+    source_type: str,
+    doc_id: str,
+    chunk_index: int,
+    total_chunks: int,
+    content_hash: str,
+    title: str = "",
+    published_date: str = "",
+) -> Dict[str, str]:
+    attrs = {
+        "source_type": sanitize_for_metadata(source_type, 64),
+        "doc_id": sanitize_for_metadata(doc_id, 200),
+        "chunk_index": str(chunk_index),
+        "total_chunks": str(total_chunks),
+        "content_hash": content_hash,
+        "title": sanitize_for_metadata(title, TITLE_MAX_BYTES),
+        "published_date": sanitize_for_metadata(published_date, 20),
+    }
+    for k in list(attrs.keys()):
+        if k in BEDROCK_RESERVED_KEYS:
+            attrs.pop(k)
+    return attrs
+
+
+def build_nonfilterable_attrs(doc_id: str, source_s3_key: str, excerpt_source_text: str) -> Dict[str, str]:
+    """
+    Packs small auxiliary context into ONE non-filterable key. Deliberately
+    does not duplicate the full chunk text -- Bedrock's own
+    AMAZON_BEDROCK_TEXT already carries that once it's declared
+    non-filterable, so writing it twice would only burn metadata budget.
+    """
+    payload = {
+        "doc_id": doc_id,
+        "original_s3_key": source_s3_key,
+        "excerpt": sanitize_for_metadata(excerpt_source_text[:EXCERPT_MAX_BYTES * 2], EXCERPT_MAX_BYTES),
+    }
+    return {LONG_META_KEY: json.dumps(payload, ensure_ascii=False)}
+
+
+def _attrs_byte_size(attrs: Dict[str, str]) -> int:
+    return sum(len(k.encode("utf-8")) + len(str(v).encode("utf-8")) for k, v in attrs.items())
+
+
+def validate_chunk_metadata(filterable_attrs: Dict[str, str], nonfilterable_attrs: Dict[str, str], chunk_text: str = "") -> Tuple[bool, List[str]]:
+    reasons: List[str] = []
+
+    if len(chunk_text.strip()) < MIN_CONTENT_CHARS:
+        reasons.append(f"chunk text has only {len(chunk_text.strip())} non-whitespace chars (min {MIN_CONTENT_CHARS}) -- likely a failed extraction")
+
+    for k in filterable_attrs:
+        if k in REQUIRED_NON_FILTERABLE_KEYS or k in BEDROCK_RESERVED_KEYS:
+            reasons.append(f"key '{k}' should not be in filterable_attrs")
+
+    filterable_size = _attrs_byte_size(filterable_attrs)
+    if filterable_size > FILTERABLE_METADATA_SAFE_BYTES:
+        reasons.append(f"filterable metadata {filterable_size}B exceeds safe budget {FILTERABLE_METADATA_SAFE_BYTES}B")
+
+    nonfilterable_size = _attrs_byte_size(nonfilterable_attrs)
+    if nonfilterable_size > NONFILTERABLE_METADATA_SAFE_BYTES:
+        reasons.append(f"non-filterable metadata {nonfilterable_size}B exceeds safe budget {NONFILTERABLE_METADATA_SAFE_BYTES}B")
+
+    sidecar_size = len(json.dumps({"metadataAttributes": {**filterable_attrs, **nonfilterable_attrs}}, ensure_ascii=False).encode("utf-8"))
+    if sidecar_size > SIDECAR_FILE_MAX_BYTES:
+        reasons.append(f"sidecar JSON {sidecar_size}B exceeds safe budget {SIDECAR_FILE_MAX_BYTES}B (10KB hard limit)")
+
+    return (len(reasons) == 0), reasons
+
+
+# ---------- S3 helpers ----------
+def upload_text_to_s3(bucket: str, key: str, body: str, dry_run: bool = False) -> bool:
+    if dry_run:
+        logger.info("[dry-run] upload s3://%s/%s (%d bytes)", bucket, key, len(body.encode("utf-8")))
+        return True
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"), ContentType="text/plain", Metadata={})
+        try:
+            s3.delete_object_tagging(Bucket=bucket, Key=key)
+        except Exception:
+            pass
+        return True
+    except ClientError as e:
+        logger.exception("Failed to upload chunk s3://%s/%s: %s", bucket, key, e)
+        return False
+
+
+def write_sidecar(bucket: str, chunk_key: str, filterable_attrs: Dict[str, str], nonfilterable_attrs: Dict[str, str], dry_run: bool = False) -> bool:
+    sidecar_key = f"{chunk_key}.metadata.json"
+    body = json.dumps({"metadataAttributes": {**filterable_attrs, **nonfilterable_attrs}}, ensure_ascii=False).encode("utf-8")
+    if dry_run:
+        logger.info("[dry-run] would write sidecar s3://%s/%s (%d bytes)", bucket, sidecar_key, len(body))
+        return True
+    try:
+        s3.put_object(Bucket=bucket, Key=sidecar_key, Body=body, ContentType="application/json", Metadata={})
+        return True
+    except ClientError as e:
+        logger.exception("Failed to write sidecar s3://%s/%s: %s", bucket, sidecar_key, e)
+        return False
+
+
+def write_quarantine(bucket: str, chunk_key: str, reasons: List[str], filterable_attrs: Dict[str, str], nonfilterable_attrs: Dict[str, str], chunk_text: str = "", dry_run: bool = False) -> str:
+    quarantine_key = f"{chunk_key}.quarantine.json".replace(STAGING_PREFIX, QUARANTINE_PREFIX, 1)
+    audit = {
+        "chunk_key": chunk_key,
+        "reasons": reasons,
+        "chunk_text_length_chars": len(chunk_text),
+        "chunk_text_length_bytes": len(chunk_text.encode("utf-8")),
+        "chunk_text_repr": repr(chunk_text),
+        "filterable_attrs_sizes": {k: len(str(v).encode("utf-8")) for k, v in filterable_attrs.items()},
+        "nonfilterable_attrs_sizes": {k: len(str(v).encode("utf-8")) for k, v in nonfilterable_attrs.items()},
+        "id": str(uuid.uuid4()),
+    }
+    if dry_run:
+        logger.warning("[dry-run] would quarantine %s: %s", chunk_key, reasons)
+        return quarantine_key
+    try:
+        s3.put_object(Bucket=bucket, Key=quarantine_key, Body=json.dumps(audit, indent=2).encode("utf-8"),
+                      ContentType="application/json", Metadata={"quarantine": "true"})
+        logger.warning("Quarantined %s: %s", chunk_key, reasons)
+    except Exception:
+        logger.exception("Failed to write quarantine audit for %s", chunk_key)
+    return quarantine_key
+
+
+def cleanup_stale_chunks_for_doc(bucket: str, staging_prefix: str, source_type: str, slug_prefix: str, dry_run: bool = False) -> int:
+    """Deletes a document's previously-written chunk/sidecar objects before writing its new set."""
+    prefix = f"{staging_prefix}/{source_type}/{slug_prefix}_chunk"
+    keys = [obj["Key"] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix)
+            for obj in page.get("Contents", [])]
+    if not keys:
+        return 0
+    if dry_run:
+        logger.info("[dry-run] would delete %d stale object(s) under s3://%s/%s*", len(keys), bucket, prefix)
+        return len(keys)
+    deleted = 0
+    for i in range(0, len(keys), 1000):
+        batch = keys[i:i + 1000]
+        try:
+            resp = s3.delete_objects(Bucket=bucket, Delete={"Objects": [{"Key": k} for k in batch]})
+            deleted += len(resp.get("Deleted", []))
+            for err in resp.get("Errors", []):
+                logger.error("Failed to delete stale object %s: %s", err.get("Key"), err.get("Message"))
+        except ClientError:
+            logger.exception("delete_objects failed for a batch under prefix %s", prefix)
+    return deleted
+
+
+def iter_s3_source_objects(bucket: str, prefix: str, extensions: Tuple[str, ...]) -> Iterator[Tuple[str, bytes, Any]]:
+    """Yields (key, body, last_modified). last_modified comes free from list_objects_v2 -- no extra API call."""
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.lower().endswith(extensions):
+                try:
+                    body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+                    yield key, body, obj.get("LastModified")
+                except ClientError as e:
+                    logger.exception("Failed to read s3://%s/%s: %s", bucket, key, e)
+
+
+# ---------- Main processing ----------
+# Adjust these prefixes/source types to match your own site structure.
+SOURCE_TYPE_BY_PREFIX = {
     "blog/posts/": "blog",
     "projects/project/": "project",
     "resume/": "resume",
 }
 
-class ChunkUploadResult(NamedTuple):
-    """
-    Lightweight record of what happened for a single chunk, captured at upload time.
-    Used so validation can confirm size limits and sidecar success WITHOUT re-listing
-    or re-downloading everything from S3 afterward -- that re-scan (a `head_object` or
-    `get_object` per chunk, times every chunk across every doc) is what was pushing
-    ingestion past the Lambda timeout.
-    """
-    chunk_key: str
-    sidecar_key: str
-    byte_size: int
-    sidecar_written: bool
 
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
-def _response(status_code: int, body: dict) -> dict:
-    return {"statusCode": status_code, "body": json.dumps(body, default=str)}
+class ChunkResult:
+    def __init__(self, chunk_key: str, sidecar_written: bool, quarantined: bool, byte_size: int):
+        self.chunk_key = chunk_key
+        self.sidecar_written = sidecar_written
+        self.quarantined = quarantined
+        self.byte_size = byte_size
 
-def _is_ingestion_in_progress() -> tuple[bool, Optional[str]]:
-    try:
-        response = bedrock_agent.list_ingestion_jobs(
-            knowledgeBaseId=KNOWLEDGE_BASE_ID,
-            dataSourceId=DATA_SOURCE_ID,
-            maxResults=10,
-            sortBy={"attribute": "STARTED_AT", "order": "DESCENDING"},
+
+def process_s3_source_and_upload(
+    source_bucket: str,
+    source_prefix: str,
+    staging_bucket: str,
+    staging_prefix: str,
+    max_bytes: int,
+    source_type: str,
+    overlap_bytes: int = 0,
+    dry_run: bool = False,
+    sample_limit_remaining: Optional[int] = None,
+) -> Tuple[List[ChunkResult], Optional[int], List[Tuple[str, bool]]]:
+    results: List[ChunkResult] = []
+    date_source_tracking: List[Tuple[str, bool]] = []  # (source_key, date_from_frontmatter) -- one entry per document
+    exts = (".md", ".markdown", ".html", ".htm", ".txt", ".pdf")
+
+    for key, body, last_modified in iter_s3_source_objects(source_bucket, source_prefix, exts):
+        if sample_limit_remaining is not None and sample_limit_remaining <= 0:
+            break
+
+        raw = extract_text_from_source(key, body)
+        title, published_date, raw, date_from_frontmatter = extract_title_and_date(key, raw, last_modified)
+        date_source_tracking.append((key, date_from_frontmatter))
+        normalized = normalize_text(raw)
+        if len(normalized.strip()) < MIN_CONTENT_CHARS:
+            logger.warning("Skipping %s: only %d chars after normalization -- likely a failed extraction.", key, len(normalized.strip()))
+            continue
+
+        chunks = semantic_chunks(normalized, max_bytes=max_bytes, overlap_bytes=overlap_bytes)
+        if not chunks:
+            continue
+
+        logger.info(
+            "CHUNK SIZES for %s: title=%r published_date=%s total=%d sizes=%s",
+            key, title, published_date, len(chunks), [len(c.encode("utf-8")) for c in chunks],
         )
-        for job in response.get("ingestionJobSummaries", []):
-            if job.get("status") in ACTIVE_STATUSES:
+
+        raw_base = key.replace("/", "_").rsplit(".", 1)[0]
+        slug_prefix = raw_base[:100]
+        doc_hash = hashlib.sha256(raw_base.encode("utf-8")).hexdigest()[:12]
+        doc_id = f"{slug_prefix}--{doc_hash}"
+        total_chunks = len(chunks)
+
+        if CLEANUP_STALE_CHUNKS:
+            cleanup_stale_chunks_for_doc(staging_bucket, staging_prefix, source_type, slug_prefix, dry_run=dry_run)
+
+        for i, c in enumerate(chunks, start=1):
+            if sample_limit_remaining is not None and sample_limit_remaining <= 0:
+                break
+
+            dest_key = f"{staging_prefix}/{source_type}/{slug_prefix}_chunk{i}.txt"
+            filterable_attrs = build_filterable_attrs(source_type, doc_id, i, total_chunks, doc_hash, title, published_date)
+            nonfilterable_attrs = build_nonfilterable_attrs(doc_id, key, c)
+
+            ok, reasons = validate_chunk_metadata(filterable_attrs, nonfilterable_attrs, chunk_text=c)
+            if not ok:
+                write_quarantine(staging_bucket, dest_key, reasons, filterable_attrs, nonfilterable_attrs, chunk_text=c, dry_run=dry_run)
+                logger.error(
+                    "QUARANTINE CONTENT for %s (chunk %d/%d, %d bytes): %s",
+                    dest_key, i, total_chunks, len(c.encode("utf-8")), repr(c[:300]),
+                )
+                results.append(ChunkResult(dest_key, False, True, len(c.encode("utf-8"))))
+            else:
+                uploaded_ok = upload_text_to_s3(staging_bucket, dest_key, c, dry_run=dry_run)
+                if uploaded_ok:
+                    sidecar_ok = write_sidecar(staging_bucket, dest_key, filterable_attrs, nonfilterable_attrs, dry_run=dry_run)
+                    results.append(ChunkResult(dest_key, sidecar_ok, not sidecar_ok, len(c.encode("utf-8"))))
+                else:
+                    results.append(ChunkResult(dest_key, False, True, len(c.encode("utf-8"))))
+
+            if sample_limit_remaining is not None:
+                sample_limit_remaining -= 1
+
+    return results, sample_limit_remaining, date_source_tracking
+
+
+# ---------- Bedrock ingestion helpers ----------
+def _is_ingestion_in_progress() -> Tuple[bool, Optional[str]]:
+    try:
+        resp = bedrock_agent.list_ingestion_jobs(knowledgeBaseId=KNOWLEDGE_BASE_ID, dataSourceId=DATA_SOURCE_ID, maxResults=10)
+        for job in resp.get("ingestionJobSummaries", []):
+            if job.get("status") in {"STARTING", "IN_PROGRESS"}:
                 return True, job.get("ingestionJobId")
     except ClientError as e:
         logger.exception("Error listing ingestion jobs: %s", e)
     return False, None
 
+
 def _start_ingestion_job() -> dict:
     client_token = f"ingest-{uuid.uuid4()}"
     try:
-        response = bedrock_agent.start_ingestion_job(
-            knowledgeBaseId=KNOWLEDGE_BASE_ID,
-            dataSourceId=DATA_SOURCE_ID,
-            clientToken=client_token,
-            description=f"Triggered by Lambda at {client_token}",
+        resp = bedrock_agent.start_ingestion_job(
+            knowledgeBaseId=KNOWLEDGE_BASE_ID, dataSourceId=DATA_SOURCE_ID,
+            clientToken=client_token, description=f"Triggered by Lambda at {client_token}",
         )
-        return response.get("ingestionJob", {})
+        return resp.get("ingestionJob", {})
     except ClientError as e:
         logger.exception("Failed to start ingestion job: %s", e)
-        raise
-
-# ---------------------------------------------------------------------------
-# Sanitizer (alnum-only) - mirrors earlier sanitizer
-# ---------------------------------------------------------------------------
-_ALNUM_RE = re.compile(r"[^A-Za-z0-9 ]+")
-
-def normalize_and_strip_to_alnum(text: str, lowercase: bool = True) -> str:
-    if not text:
-        return ""
-    text = unicodedata.normalize("NFKC", text)
-    text = text.replace("â€™", "'").replace("â€“", "-").replace("â€”", "-").replace("â†’", "->")
-    # remove emoji / pictographs ranges
-    text = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u26FF]+", " ", text)
-    # remove control chars
-    text = re.sub(r"[\x00-\x1F\x7F]+", " ", text)
-    # remove fenced code blocks and images/links
-    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
-    text = re.sub(r"!\[.*?\]\(.*?\)", " ", text)
-    text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
-    # strip markdown headings, lists, tables
-    text = re.sub(r"^#{1,6}\s*", " ", text, flags=re.MULTILINE)
-    text = re.sub(r"^\s*[-*+]\s+", " ", text, flags=re.MULTILINE)
-    text = re.sub(r"^\|.*\|$", " ", text, flags=re.MULTILINE)
-    # replace any non-alnum (except space) with space
-    text = _ALNUM_RE.sub(" ", text)
-    # collapse whitespace
-    text = re.sub(r"\s+", " ", text).strip()
-    if lowercase:
-        text = text.lower()
-    return text
+        return {}
 
 
-def pdf_to_text_bytes(body: bytes) -> str:
-    """Convert PDF bytes (from S3) to text using pdfminer."""
-    tmp_path = "/tmp/temp_resume.pdf"
-    with open(tmp_path, "wb") as f:
-        f.write(body)
-    return extract_text(tmp_path)
+# ---------- Lambda handler ----------
+def _response(status_code: int, body: dict) -> dict:
+    return {"statusCode": status_code, "body": json.dumps(body, default=str)}
 
-# ---------------------------------------------------------------------------
-# Chunking helpers (byte-based, with overlap)
-# ---------------------------------------------------------------------------
-def chunk_text_by_bytes(text: str, max_bytes: int, overlap_bytes: int = 0) -> List[str]:
-    """
-    Chunk text into pieces where each chunk's UTF-8 encoded byte length <= max_bytes.
-    Splits on word boundaries to avoid breaking words.
 
-    overlap_bytes: number of trailing bytes (snapped to whole words) from the END of
-    the previous chunk that get carried forward as the START of the next chunk. This
-    prevents context from being lost outright at chunk boundaries and gives the
-    embedding model a bit more self-contained context per chunk, reducing (but not
-    eliminating) the need to stitch many neighbors back together at query time.
-    """
-    if not text:
-        return []
-    words = text.split()
-    chunks: List[str] = []
-    cur_words: List[str] = []
-    cur_bytes = 0
-
-    def flush_and_start_new(carry_words: List[str]):
-        nonlocal cur_words, cur_bytes
-        if cur_words:
-            chunks.append(" ".join(cur_words))
-        cur_words = list(carry_words)
-        cur_bytes = len((" ".join(cur_words)).encode("utf-8")) if cur_words else 0
-
-    def overlap_tail(word_list: List[str], max_overlap_bytes: int) -> List[str]:
-        if max_overlap_bytes <= 0 or not word_list:
-            return []
-        tail: List[str] = []
-        tail_bytes = 0
-        for w in reversed(word_list):
-            add = len(w.encode("utf-8")) + (1 if tail else 0)
-            if tail_bytes + add > max_overlap_bytes:
-                break
-            tail.insert(0, w)
-            tail_bytes += add
-        return tail
-
-    for w in words:
-        prefix = " " if cur_words else ""
-        candidate = (prefix + w).encode("utf-8")
-        cand_len = len(candidate)
-        if cur_bytes + cand_len > max_bytes:
-            carry = overlap_tail(cur_words, overlap_bytes)
-            flush_and_start_new(carry)
-            # re-append current word to the freshly started (carried-over) chunk
-            prefix2 = " " if cur_words else ""
-            add_len = len((prefix2 + w).encode("utf-8"))
-            cur_words.append(w)
-            cur_bytes += add_len
-            # if a single word plus carry still exceeds max_bytes, force-split the word
-            if cur_bytes > max_bytes:
-                word_bytes = w.encode("utf-8")
-                # drop the just-added whole word, split it by raw bytes instead
-                cur_words.pop()
-                cur_bytes -= add_len
-                if cur_words:
-                    chunks.append(" ".join(cur_words))
-                cur_words = []
-                cur_bytes = 0
-                start = 0
-                while start < len(word_bytes):
-                    end = min(start + max_bytes, len(word_bytes))
-                    slice_bytes = word_bytes[start:end]
-                    try:
-                        slice_text = slice_bytes.decode("utf-8")
-                    except UnicodeDecodeError:
-                        back = end - 1
-                        slice_text = None
-                        while back > start:
-                            try:
-                                slice_text = word_bytes[start:back].decode("utf-8")
-                                end = back
-                                break
-                            except UnicodeDecodeError:
-                                back -= 1
-                        if slice_text is None:
-                            slice_text = word_bytes[start:end].decode("utf-8", errors="replace")
-                    chunks.append(slice_text)
-                    start = end
-        else:
-            cur_words.append(w)
-            cur_bytes += cand_len
-    if cur_words:
-        chunks.append(" ".join(cur_words))
-    return chunks
-
-# ---------------------------------------------------------------------------
-# S3 helpers (upload chunks + metadata sidecars, clear metadata)
-# ---------------------------------------------------------------------------
-def upload_text_to_s3(bucket: str, key: str, body: str, dry_run: bool = False) -> None:
-    """
-    Uploads body as UTF-8 text/plain with empty S3 object Metadata (HTTP headers).
-    NOTE: this is distinct from the Bedrock KB metadata sidecar written by
-    write_metadata_sidecar() below -- Bedrock KB filterable attributes must live in
-    a `<key>.metadata.json` file, not in S3 object Metadata headers.
-    """
-    if dry_run:
-        logger.info("[dry-run] would upload s3://%s/%s (%d bytes)", bucket, key, len(body.encode("utf-8")))
-        return
-    try:
-        s3.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=body.encode("utf-8"),
-            ContentType="text/plain",
-            Metadata={},  # ensure no S3 object metadata headers
-        )
-        logger.info("Uploaded s3://%s/%s (%d bytes)", bucket, key, len(body.encode("utf-8")))
-    except ClientError as e:
-        logger.exception("Failed to upload %s/%s: %s", bucket, key, e)
-        raise
-
-def write_metadata_sidecar(
-    bucket: str,
-    chunk_key: str,
-    source_type: str,
-    doc_id: str,
-    chunk_index: int,
-    total_chunks: int,
-    dry_run: bool = False,
-) -> str:
-    """
-    Writes the Bedrock KB metadata sidecar for a chunk object at `<chunk_key>.metadata.json`.
-    This is what allows retrieval-time filtering (e.g. filter: source_type == "project")
-    instead of relying on vector similarity + prompt instructions to separate resume
-    content from project/blog content.
-
-    IMPORTANT: Bedrock KB metadata sidecars use FLAT scalar values under
-    "metadataAttributes" -- Bedrock infers the attribute type from the JSON value type
-    itself (string -> STRING, number -> NUMBER, bool -> BOOLEAN, list of strings ->
-    STRING_LIST). Do NOT wrap values in a {"value": ..., "type": ...} object -- that
-    shape gets rejected by the ingestion job with a generic "metadata file is not in
-    valid JSON format" error, even though it's syntactically valid JSON. (This bit us:
-    an earlier version of this function used the {value,type} wrapper and every single
-    chunk's sidecar was silently ignored across an entire ingestion run.)
-    """
-    sidecar_key = f"{chunk_key}.metadata.json"
-    payload = {
-        "metadataAttributes": {
-            "source_type": source_type,
-            "doc_id": doc_id,
-            "chunk_index": chunk_index,
-            "total_chunks": total_chunks,
-        }
-    }
-    if dry_run:
-        logger.info("[dry-run] would write sidecar s3://%s/%s -> %s", bucket, sidecar_key, payload)
-        return sidecar_key
-    try:
-        s3.put_object(
-            Bucket=bucket,
-            Key=sidecar_key,
-            Body=json.dumps(payload).encode("utf-8"),
-            ContentType="application/json",
-            Metadata={},
-        )
-        logger.info("Wrote metadata sidecar s3://%s/%s", bucket, sidecar_key)
-    except ClientError as e:
-        logger.exception("Failed to write metadata sidecar %s/%s: %s", bucket, sidecar_key, e)
-        raise
-    return sidecar_key
-
-def clear_object_metadata(bucket: str, key: str, dry_run: bool = False) -> None:
-    """
-    Rewrites an object to replace S3 object metadata (HTTP headers) with empty dict.
-    """
-    if dry_run:
-        logger.info("[dry-run] would clear metadata for s3://%s/%s", bucket, key)
-        return
-    try:
-        s3.copy_object(
-            Bucket=bucket,
-            CopySource={"Bucket": bucket, "Key": key},
-            Key=key,
-            Metadata={},
-            MetadataDirective="REPLACE"
-        )
-        logger.info("Cleared metadata for s3://%s/%s", bucket, key)
-    except ClientError as e:
-        logger.exception("Failed to clear metadata for %s/%s: %s", bucket, key, e)
-        raise
-
-# ---------------------------------------------------------------------------
-# Source iterators (S3 and local)
-# ---------------------------------------------------------------------------
-def iter_s3_source_objects(bucket: str, prefix: str, extensions: Tuple[str, ...]) -> Iterator[Tuple[str, bytes]]:
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.lower().endswith(extensions):
-                resp = s3.get_object(Bucket=bucket, Key=key)
-                body = resp["Body"].read()
-                yield key, body
-
-def iter_local_files(source_dir: str, extensions: Tuple[str, ...]) -> Iterator[Path]:
-    p = Path(source_dir)
-    for path in p.rglob("*"):
-        if path.is_file() and path.suffix.lower() in extensions:
-            yield path
-
-# ---------------------------------------------------------------------------
-# Main processing: sanitize, chunk (by bytes, with overlap), upload + metadata
-# ---------------------------------------------------------------------------
-def process_s3_source_and_upload(source_bucket: str, source_prefix: str,
-                                 staging_bucket: str, staging_prefix: str,
-                                 max_bytes: int, source_type: str,
-                                 overlap_bytes: int = 0, dry_run: bool = False) -> List[ChunkUploadResult]:
-    """
-    Read files from source_bucket/source_prefix, sanitize, chunk by bytes (with overlap),
-    upload each chunk to staging, and write a Bedrock KB metadata sidecar per chunk
-    carrying `source_type` (resume/project/blog), `doc_id`, `chunk_index`, `total_chunks`.
-
-    Returns a ChunkUploadResult per chunk with the byte size and sidecar-write outcome
-    captured inline at upload time. This is what the handler's validation step reads
-    from -- deliberately avoiding a second pass that re-lists/re-downloads everything
-    from S3 afterward, since that repeated per-object GET/HEAD traffic was pushing
-    ingestion past the Lambda timeout.
-    """
-    results: List[ChunkUploadResult] = []
-    exts = (".md", ".markdown", ".html", ".htm", ".txt", ".pdf")
-    for key, body in iter_s3_source_objects(source_bucket, source_prefix, exts):
-
-        if key.lower().endswith(".pdf"):
-            tmp_path = "/tmp/temp_resume.pdf"
-            with open(tmp_path, "wb") as f:
-                f.write(body)
-            raw = extract_text(tmp_path)
-        else:
-            raw = body.decode("utf-8", errors="replace")
-
-        sanitized = normalize_and_strip_to_alnum(raw, lowercase=True)
-        chunks = chunk_text_by_bytes(sanitized, max_bytes, overlap_bytes=overlap_bytes)
-        base = key.replace("/", "_").rsplit(".", 1)[0]
-        if not chunks:
-            logger.info("Skipping empty after sanitize: %s", key)
-            continue
-        total_chunks = len(chunks)
-        for i, c in enumerate(chunks, start=1):
-            dest_key = f"{staging_prefix}/{base}_chunk{i}.txt"
-            upload_text_to_s3(staging_bucket, dest_key, c, dry_run=dry_run)
-            sidecar_key = write_metadata_sidecar(
-                staging_bucket, dest_key,
-                source_type=source_type, doc_id=base,
-                chunk_index=i, total_chunks=total_chunks,
-                dry_run=dry_run,
-            )
-            results.append(ChunkUploadResult(
-                chunk_key=dest_key,
-                sidecar_key=sidecar_key,
-                byte_size=len(c.encode("utf-8")),
-                sidecar_written=True,  # write_metadata_sidecar raises on failure, so
-                                        # reaching this line means it succeeded (or was
-                                        # a dry-run, which we also count as "would succeed")
-            ))
-    return results
-
-def process_local_dir_and_upload(source_dir: str,
-                                 staging_bucket: str, staging_prefix: str,
-                                 max_bytes: int, source_type: str,
-                                 overlap_bytes: int = 0, dry_run: bool = False) -> List[ChunkUploadResult]:
-    results: List[ChunkUploadResult] = []
-    exts = (".md", ".markdown", ".html", ".htm", ".txt", ".pdf")
-    for path in iter_local_files(source_dir, exts):
-
-        if path.suffix.lower() == ".pdf":
-            raw = extract_text(str(path))
-        else:
-            raw = path.read_text(encoding="utf-8", errors="replace")
-
-        sanitized = normalize_and_strip_to_alnum(raw, lowercase=True)
-        chunks = chunk_text_by_bytes(sanitized, max_bytes, overlap_bytes=overlap_bytes)
-        base = path.relative_to(source_dir).as_posix().replace("/", "_").rsplit(".", 1)[0]
-        if not chunks:
-            logger.info("Skipping empty after sanitize: %s", path)
-            continue
-        total_chunks = len(chunks)
-        for i, c in enumerate(chunks, start=1):
-            dest_key = f"{staging_prefix}/{base}_chunk{i}.txt"
-            upload_text_to_s3(staging_bucket, dest_key, c, dry_run=dry_run)
-            sidecar_key = write_metadata_sidecar(
-                staging_bucket, dest_key,
-                source_type=source_type, doc_id=base,
-                chunk_index=i, total_chunks=total_chunks,
-                dry_run=dry_run,
-            )
-            results.append(ChunkUploadResult(
-                chunk_key=dest_key,
-                sidecar_key=sidecar_key,
-                byte_size=len(c.encode("utf-8")),
-                sidecar_written=True,
-            ))
-    return results
-
-# ---------------------------------------------------------------------------
-# Validation helpers
-# ---------------------------------------------------------------------------
-def find_orphan_metadata_sidecars(bucket: str, prefix: str) -> List[str]:
-    """
-    A `<key>.metadata.json` sidecar is EXPECTED now (one per chunk). This check finds
-    sidecars that do NOT have a matching chunk object -- those are the ones that would
-    indicate a real problem (e.g. a stale sidecar left behind after a chunk was deleted
-    or renamed), as opposed to the old behavior which aborted on ANY sidecar presence.
-    """
-    paginator = s3.get_paginator("list_objects_v2")
-    all_keys = set()
-    sidecar_keys = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            all_keys.add(key)
-            if key.endswith(".metadata.json"):
-                sidecar_keys.append(key)
-
-    orphans = []
-    for sk in sidecar_keys:
-        chunk_key = sk[: -len(".metadata.json")]
-        if chunk_key not in all_keys:
-            orphans.append(sk)
-            if len(orphans) >= VALIDATION_SAMPLE_LIMIT:
-                break
-    return orphans
-
-def find_chunks_missing_metadata(bucket: str, prefix: str) -> List[str]:
-    """
-    Every chunk .txt object should have a matching `<key>.metadata.json` sidecar.
-    Returns a sample of chunk keys that are missing one -- these would silently fall
-    back to unfiltered retrieval, which is exactly the bug we're fixing.
-    """
-    paginator = s3.get_paginator("list_objects_v2")
-    all_keys = set()
-    chunk_keys = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            all_keys.add(key)
-            if key.endswith(".txt"):
-                chunk_keys.append(key)
-
-    missing = []
-    for ck in chunk_keys:
-        if f"{ck}.metadata.json" not in all_keys:
-            missing.append(ck)
-            if len(missing) >= VALIDATION_SAMPLE_LIMIT:
-                break
-    return missing
-
-def find_objects_with_metadata(bucket: str, prefix: str) -> List[Tuple[str, dict]]:
-    """
-    Return list of chunk .txt objects under prefix that have non-empty S3 OBJECT
-    metadata (HTTP headers) -- this is still unwanted; it's unrelated to the
-    `.metadata.json` sidecar files, which are expected and checked separately above.
-    """
-    paginator = s3.get_paginator("list_objects_v2")
-    bad = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".metadata.json"):
-                continue
-            try:
-                h = s3.head_object(Bucket=bucket, Key=key)
-                meta = h.get("Metadata", {})
-                if meta:
-                    bad.append((key, meta))
-                    if len(bad) >= VALIDATION_SAMPLE_LIMIT:
-                        return bad
-            except Exception as e:
-                logger.exception("head-object failed for %s: %s", key, e)
-    return bad
-
-def list_large_objects_by_bytes(bucket: str, prefix: str, threshold_bytes: int) -> List[Tuple[str, int]]:
-    """
-    Return list of chunk .txt objects whose UTF-8 body bytes exceed threshold_bytes.
-    Sidecar .metadata.json files are excluded from this check -- they're small JSON
-    and aren't subject to the KB chunk-size limit.
-    """
-    paginator = s3.get_paginator("list_objects_v2")
-    large = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".metadata.json"):
-                continue
-            try:
-                resp = s3.get_object(Bucket=bucket, Key=key)
-                body = resp["Body"].read()
-                size = len(body)
-                if size > threshold_bytes:
-                    large.append((key, size))
-                    if len(large) >= VALIDATION_SAMPLE_LIMIT:
-                        return large
-            except Exception as e:
-                logger.exception("Failed reading %s: %s", key, e)
-    return large
-
-# ---------------------------------------------------------------------------
-# Handler (Lambda entrypoint)
-# ---------------------------------------------------------------------------
 def handler(event, context):
-    logger.info("Starting ingestion pipeline run | KB=%s | DataSource=%s", KNOWLEDGE_BASE_ID, DATA_SOURCE_ID)
+    logger.info("Starting ingestion pipeline | KB=%s | DS=%s | VALIDATE_ONLY=%s | DRY_RUN=%s",
+                KNOWLEDGE_BASE_ID, DATA_SOURCE_ID, VALIDATE_ONLY, DRY_RUN)
 
-    # 0. Basic env validation
-    missing = []
-    for name in ("FRONTEND_BUCKET", "STAGING_BUCKET", "KNOWLEDGE_BASE_ID", "DATA_SOURCE_ID"):
-        if not globals().get(name):
-            missing.append(name)
+    missing = [n for n in ("FRONTEND_BUCKET", "STAGING_BUCKET", "KNOWLEDGE_BASE_ID", "DATA_SOURCE_ID") if not globals().get(n)]
     if missing:
-        msg = f"Missing required environment variables: {', '.join(missing)}"
-        logger.error(msg)
         return _response(500, {"status": "error", "reason": "missing_env", "missing": missing})
 
-    # 1. Check ingestion in progress
+    index_ok, index_msg, actual_non_filterable = verify_index_metadata_config()
+    if not index_ok:
+        logger.error("Index config check failed: %s", index_msg)
+        return _response(500, {"status": "error", "reason": "index_metadata_config_invalid", "detail": index_msg})
+    logger.info("Index config check passed. Non-filterable keys: %s", sorted(actual_non_filterable))
+
+    if not _PDFMINER_AVAILABLE:
+        logger.warning("pdfminer.six not importable -- PDFs will fall back to raw decode and likely produce empty content.")
+
     in_progress, active_job_id = _is_ingestion_in_progress()
     if in_progress:
-        logger.info("Ingestion already in progress: %s", active_job_id)
         return _response(200, {"status": "skipped", "reason": "ingestion_in_progress", "activeJobId": active_job_id})
 
-    # 2. Convert, chunk (with overlap), and upload source content + metadata sidecars
     try:
-        uploaded: List[ChunkUploadResult] = []
+        all_results: List[ChunkResult] = []
+        all_date_tracking: List[Tuple[str, bool]] = []
+        sample_remaining = VALIDATION_SAMPLE_LIMIT if VALIDATION_SAMPLE_LIMIT > 0 else None
         for source_prefix, source_type in SOURCE_TYPE_BY_PREFIX.items():
-            logger.info("Processing source prefix s3://%s/%s -> source_type=%s", FRONTEND_BUCKET, source_prefix, source_type)
-            results = process_s3_source_and_upload(
-                FRONTEND_BUCKET, source_prefix, STAGING_BUCKET, STAGING_PREFIX,
-                MAX_CHUNK_BYTES, source_type=source_type,
-                overlap_bytes=CHUNK_OVERLAP_BYTES, dry_run=DRY_RUN,
+            if sample_remaining is not None and sample_remaining <= 0:
+                break
+            results, sample_remaining, date_tracking = process_s3_source_and_upload(
+                FRONTEND_BUCKET, source_prefix, STAGING_BUCKET, STAGING_PREFIX, MAX_CHUNK_BYTES,
+                source_type=source_type, overlap_bytes=CHUNK_OVERLAP_BYTES, dry_run=DRY_RUN,
+                sample_limit_remaining=sample_remaining,
             )
-            uploaded.extend(results)
-        logger.info("Uploaded %d chunked objects (+ metadata sidecars) to staging (dry_run=%s)", len(uploaded), DRY_RUN)
+            all_results.extend(results)
+            all_date_tracking.extend(date_tracking)
     except Exception as e:
-        logger.exception("Preprocessing/conversion failed: %s", e)
+        logger.exception("Preprocessing failed: %s", e)
         return _response(500, {"status": "error", "reason": "preprocessing_failed", "error": str(e)})
 
-    # 3. Validate from the in-memory upload results captured above -- deliberately NOT
-    #    re-listing/re-downloading the staging prefix from S3 here. The previous version
-    #    of this validation ran 4 separate full-prefix scans, two of which issued a
-    #    head_object or get_object call PER CHUNK to re-check what we already knew at
-    #    upload time (size, sidecar success). For a KB with several docs x 10-15 chunks
-    #    each, that easily added hundreds of extra sequential round trips after the
-    #    upload had already finished, which is what pushed this Lambda past its 30s
-    #    timeout (Sandbox.Timedout). Since upload_text_to_s3/write_metadata_sidecar both
-    #    raise on failure (aborting step 2 above) and we captured byte_size inline while
-    #    building each chunk, everything we need to validate is already in `uploaded`.
+    quarantined = [r for r in all_results if r.quarantined]
+    docs_with_frontmatter_date = [k for k, from_fm in all_date_tracking if from_fm]
+    docs_with_fallback_date = [k for k, from_fm in all_date_tracking if not from_fm]
+    summary = {
+        "total_chunks": len(all_results),
+        "ok_chunks": len(all_results) - len(quarantined),
+        "quarantined_chunks": len(quarantined),
+        "quarantined_keys": [r.chunk_key for r in quarantined][:50],
+        "docs_with_frontmatter_date": len(docs_with_frontmatter_date),
+        "docs_with_last_modified_fallback_date": len(docs_with_fallback_date),
+        "docs_needing_frontmatter_date": docs_with_fallback_date[:50],
+    }
+
+    if VALIDATE_ONLY:
+        return _response(200, {"status": "validated", **summary})
+
+    if quarantined and ABORT_ON_ANY_QUARANTINE:
+        logger.error("Aborting before ingestion job: %s", summary)
+        return _response(500, {"status": "error", "reason": "chunks_quarantined", **summary})
+
     if not DRY_RUN:
-        oversized = [r for r in uploaded if r.byte_size > MAX_CHUNK_BYTES]
-        if oversized:
-            logger.warning("Found %d chunk(s) exceeding MAX_CHUNK_BYTES.", len(oversized))
-            return _response(400, {
-                "status": "validation_failed",
-                "reason": "staging_objects_too_large",
-                "sample_large_objects": [(r.chunk_key, r.byte_size) for r in oversized[:VALIDATION_SAMPLE_LIMIT]],
-                "advice": "Re-chunk source files so each uploaded chunk is <= MAX_CHUNK_BYTES bytes.",
-            })
+        _start_ingestion_job()
 
-        missing_sidecar = [r for r in uploaded if not r.sidecar_written]
-        if missing_sidecar:
-            logger.warning("Found %d chunk(s) without a successfully written metadata sidecar.", len(missing_sidecar))
-            return _response(400, {
-                "status": "validation_failed",
-                "reason": "chunks_missing_metadata_sidecar",
-                "sample_chunks_missing_metadata": [r.chunk_key for r in missing_sidecar[:VALIDATION_SAMPLE_LIMIT]],
-                "advice": "Every chunk .txt object must have a matching <key>.metadata.json sidecar for retrieval-time filtering to work.",
-            })
+    return _response(200, {"status": "ok", "dry_run": DRY_RUN, **summary})
 
-        # S3 object metadata headers are hardcoded to {} in upload_text_to_s3, so there's
-        # nothing to re-verify per-invocation here. If you ever want to audit the bucket
-        # for drift (e.g. objects touched by some other process), run
-        # find_objects_with_metadata() / find_orphan_metadata_sidecars() manually or from
-        # a separate, non-latency-sensitive job -- not inline in this handler.
 
-    # 6. Start ingestion job
-    if DRY_RUN:
-        logger.info("Dry run enabled; skipping ingestion start.")
-        return _response(200, {"status": "dry_run", "uploaded_count": len(uploaded)})
-
-    try:
-        job = _start_ingestion_job()
-    except Exception as e:
-        logger.exception("Failed to start ingestion job: %s", e)
-        return _response(500, {"status": "error", "reason": "start_ingestion_failed", "error": str(e)})
-
-    return _response(200, {
-        "status": "started",
-        "ingestionJobId": job.get("ingestionJobId"),
-        "ingestionJobStatus": job.get("status"),
-        "knowledgeBaseId": KNOWLEDGE_BASE_ID,
-        "dataSourceId": DATA_SOURCE_ID,
-        "uploaded_count": len(uploaded)
-    })
-
-# ---------------------------------------------------------------------------
-# Local test runner
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Local runner for app.py")
-    parser.add_argument("--local-dir", help="Local source directory to process (optional)")
-    parser.add_argument("--source-type", default="resume", choices=["resume", "project", "blog"],
-                         help="source_type to tag chunks with when using --local-dir")
-    parser.add_argument("--dry-run", action="store_true", help="Do not upload or start ingestion")
-    parser.add_argument("--profile", help="AWS profile to use (optional)")
-    parser.add_argument("--max-bytes", type=int, default=MAX_CHUNK_BYTES, help="Max bytes per chunk")
-    parser.add_argument("--overlap-bytes", type=int, default=CHUNK_OVERLAP_BYTES, help="Overlap bytes between chunks")
-    args = parser.parse_args()
-
-    if args.profile:
-        import boto3.session
-        session = boto3.session.Session(profile_name=args.profile)
-        s3 = session.client("s3")
-        bedrock_agent = session.client("bedrock-agent", region_name=REGION)
-
-    if args.local_dir:
-        logger.info("Processing local directory %s -> s3://%s/%s (dry_run=%s)", args.local_dir, STAGING_BUCKET, STAGING_PREFIX, args.dry_run or DRY_RUN)
-        keys = process_local_dir_and_upload(
-            args.local_dir, STAGING_BUCKET, STAGING_PREFIX, args.max_bytes,
-            source_type=args.source_type, overlap_bytes=args.overlap_bytes,
-            dry_run=(args.dry_run or DRY_RUN),
-        )
-        logger.info("Local processing uploaded %d keys (dry_run=%s)", len(keys), args.dry_run or DRY_RUN)
-    else:
-        logger.info("Running handler in dry-run mode (no local dir provided)")
-        resp = handler({}, None)
-        print(json.dumps(resp, indent=2))
+    logger.setLevel(logging.DEBUG)
+    print("Local debug run (dry-run)")
+    ok, msg, keys = verify_index_metadata_config()
+    print("INDEX CHECK:", ok, msg, keys)
+    res, _remaining, _date_tracking = process_s3_source_and_upload(
+        FRONTEND_BUCKET or "your-frontend-bucket", "blog/posts/",
+        STAGING_BUCKET or "your-staging-bucket", STAGING_PREFIX, MAX_CHUNK_BYTES,
+        source_type="blog", overlap_bytes=CHUNK_OVERLAP_BYTES, dry_run=True,
+    )
+    for r in res[:20]:
+        print("RESULT:", r.chunk_key, r.sidecar_written, r.quarantined, r.byte_size)
