@@ -15,3 +15,7 @@ python-dotenv>=1.0.0
 strands-agents>=0.1.0
 strands-agents-tools>=0.1.0
 opencv-python
+
+# MCP 
+mcp[cli]
+httpx
