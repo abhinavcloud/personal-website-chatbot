@@ -1,9 +1,11 @@
 import os
 import re
+import time
 import base64
 import httpx
 import yaml
 from mcp.server.fastmcp import FastMCP
+
 
 
 GITHUB_OWNER = "abhinavcloud"
@@ -13,12 +15,34 @@ BLOG_PATH = "site/blog/posts"
 PROJECTS_PATH = "site/projects/project"
 RESUME_PATH = "site/resume/resume.md"
 GITHUB_API = "https://api.github.com"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optional but strongly recommended
+
+# Directory-listing cache: avoids re-fetching every file's content on every
+# list/first/last/latest/oldest call within a session. Content rarely changes
+# mid-conversation, so a short TTL is safe and collapses N redundant calls
+# into 1 per directory per window.
+CACHE_TTL_SECONDS = 300
+_entry_cache: dict[str, tuple[float, list[dict]]] = {}
 
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?\n)---\s*\n", re.DOTALL)
 
 mcp = FastMCP(
     "Abhinav Personal Website"
 )
+
+
+
+
+
+def _github_headers() -> dict:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "abhinav-personal-website-mcp",
+    }
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return headers
 
 
 async def github_get(path: str):
@@ -28,11 +52,6 @@ async def github_get(path: str):
         f"{GITHUB_REPO}/contents/"
         f"{path.lstrip('/')}"
     )
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "abhinav-personal-website-mcp",
-    }
     params = {
         "ref": GITHUB_BRANCH
     }
@@ -41,8 +60,19 @@ async def github_get(path: str):
     ) as client:
         response = await client.get(
             url,
-            headers=headers,
+            headers=_github_headers(),
             params=params,
+        )
+
+    if response.status_code == 403 and "rate limit" in response.text.lower():
+        remaining = response.headers.get("x-ratelimit-remaining", "unknown")
+        reset = response.headers.get("x-ratelimit-reset", "unknown")
+        raise RuntimeError(
+            "GITHUB_RATE_LIMIT_EXCEEDED: The website data source (GitHub API) has "
+            f"hit its request rate limit (remaining={remaining}, reset_epoch={reset}). "
+            "This is a temporary infrastructure issue, not missing data. Do not guess, "
+            "infer, or fabricate an answer. Tell the user plainly that live data is "
+            "temporarily unavailable due to rate limiting and to try again shortly."
         )
     response.raise_for_status()
     return response.json()
@@ -79,12 +109,19 @@ def strip_frontmatter(content: str) -> str:
     return FRONTMATTER_RE.sub("", content, count=1).lstrip("\n")
 
 
-async def list_markdown_entries(dir_path: str) -> list[dict]:
+async def list_markdown_entries(dir_path: str, force_refresh: bool = False) -> list[dict]:
     """
     List markdown files in a GitHub directory, fetching and parsing
     each file's frontmatter metadata (title, subtitle, date, readingTime,
-    tags, icon).
+    tags, icon). Results are cached per directory for CACHE_TTL_SECONDS to
+    avoid redundant GitHub API calls within a session.
     """
+    now = time.time()
+    if not force_refresh:
+        cached = _entry_cache.get(dir_path)
+        if cached and (now - cached[0]) < CACHE_TTL_SECONDS:
+            return cached[1]
+
     data = await github_get(dir_path)
     if not isinstance(data, list):
         raise ValueError(f"{dir_path} is not a directory")
@@ -113,11 +150,13 @@ async def list_markdown_entries(dir_path: str) -> list[dict]:
         })
 
     # Newest first; entries with no/unparsable date sort last.
-    return sorted(
+    sorted_entries = sorted(
         entries,
         key=lambda x: x.get("date") or "",
         reverse=True,
     )
+    _entry_cache[dir_path] = (now, sorted_entries)
+    return sorted_entries
 
 
 async def read_markdown_entry(path: str, root: str, kind: str) -> dict:
@@ -152,14 +191,90 @@ async def read_markdown_entry(path: str, root: str, kind: str) -> dict:
     }
 
 
+def _pick_extreme(entries: list[dict], newest: bool) -> dict:
+    """
+    Deterministically pick the newest or oldest entry by date.
+    Recomputes from the given list rather than assuming any prior sort order.
+    """
+    if not entries:
+        return {}
+    dated = [e for e in entries if e.get("date")]
+    pool = dated or entries
+    return (
+        max(pool, key=lambda x: x.get("date") or "")
+        if newest
+        else min(pool, key=lambda x: x.get("date") or "")
+    )
+
+
+def _top_n(entries: list[dict], n: int, newest: bool) -> list[dict]:
+    """Deterministically return the top-n entries by date, newest or oldest first."""
+    dated = [e for e in entries if e.get("date")]
+    pool = dated or entries
+    ordered = sorted(pool, key=lambda x: x.get("date") or "", reverse=newest)
+    return ordered[: max(0, n)]
+
+
+# ---------------------------------------------------------------------------
+# Blog tools
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 async def list_blogs() -> list[dict]:
     """
     List all blogs currently present in the website repository,
     including title, subtitle, date, reading time, tags, and icon
     parsed from each post's frontmatter. Sorted newest first.
+
+    Use this for browsing/listing all blogs. For "first/oldest blog" or
+    "most recent N blogs" questions, prefer get_first_blog / get_last_blog /
+    get_latest_blogs / get_oldest_blogs instead — do not compute min/max
+    yourself from this list.
     """
     return await list_markdown_entries(BLOG_PATH)
+
+
+@mcp.tool()
+async def get_first_blog() -> dict:
+    """
+    Return the single oldest blog (the first one Abhinav ever wrote),
+    determined by comparing dates across ALL blogs, not just recently
+    discussed ones. Always use this tool — do not infer the first blog
+    from a partial list already seen in conversation.
+    """
+    entries = await list_markdown_entries(BLOG_PATH)
+    return _pick_extreme(entries, newest=False)
+
+
+@mcp.tool()
+async def get_last_blog() -> dict:
+    """
+    Return the single most recent blog Abhinav has written, determined
+    by comparing dates across ALL blogs.
+    """
+    entries = await list_markdown_entries(BLOG_PATH)
+    return _pick_extreme(entries, newest=True)
+
+
+@mcp.tool()
+async def get_latest_blogs(n: int = 4) -> list[dict]:
+    """
+    Return the n most recent blogs, newest first, computed by sorting
+    ALL blogs by date. Use this instead of manually picking from list_blogs
+    output.
+    """
+    entries = await list_markdown_entries(BLOG_PATH)
+    return _top_n(entries, n, newest=True)
+
+
+@mcp.tool()
+async def get_oldest_blogs(n: int = 4) -> list[dict]:
+    """
+    Return the n oldest blogs, oldest first, computed by sorting ALL
+    blogs by date.
+    """
+    entries = await list_markdown_entries(BLOG_PATH)
+    return _top_n(entries, n, newest=False)
 
 
 @mcp.tool()
@@ -172,14 +287,56 @@ async def read_blog(path: str) -> dict:
     return await read_markdown_entry(path, BLOG_PATH, "blog")
 
 
+# ---------------------------------------------------------------------------
+# Project tools
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 async def list_projects() -> list[dict]:
     """
     List all projects currently present in the website repository,
     including title, subtitle, date, reading time, tags, and icon
     parsed from each project's frontmatter. Sorted newest first.
+
+    For "first/oldest project" or "most recent N projects" questions,
+    prefer get_first_project / get_last_project / get_latest_projects /
+    get_oldest_projects instead of computing min/max yourself.
     """
     return await list_markdown_entries(PROJECTS_PATH)
+
+
+@mcp.tool()
+async def get_first_project() -> dict:
+    """
+    Return the single oldest project (the first one Abhinav worked on),
+    determined by comparing dates across ALL projects.
+    """
+    entries = await list_markdown_entries(PROJECTS_PATH)
+    return _pick_extreme(entries, newest=False)
+
+
+@mcp.tool()
+async def get_last_project() -> dict:
+    """
+    Return the single most recent project, determined by comparing
+    dates across ALL projects.
+    """
+    entries = await list_markdown_entries(PROJECTS_PATH)
+    return _pick_extreme(entries, newest=True)
+
+
+@mcp.tool()
+async def get_latest_projects(n: int = 4) -> list[dict]:
+    """Return the n most recent projects, newest first."""
+    entries = await list_markdown_entries(PROJECTS_PATH)
+    return _top_n(entries, n, newest=True)
+
+
+@mcp.tool()
+async def get_oldest_projects(n: int = 4) -> list[dict]:
+    """Return the n oldest projects, oldest first."""
+    entries = await list_markdown_entries(PROJECTS_PATH)
+    return _top_n(entries, n, newest=False)
 
 
 @mcp.tool()
@@ -190,6 +347,11 @@ async def read_projects(path: str) -> dict:
     markdown body with the frontmatter stripped out.
     """
     return await read_markdown_entry(path, PROJECTS_PATH, "project")
+
+
+# ---------------------------------------------------------------------------
+# Resume tool
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
 async def read_resume() -> dict:
@@ -206,7 +368,6 @@ async def read_resume() -> dict:
         "path": RESUME_PATH,
         "content": body,
     }
-
 
 if __name__ == "__main__":
 
