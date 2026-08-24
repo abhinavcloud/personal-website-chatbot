@@ -18,9 +18,10 @@ from strands.session.file_session_manager import FileSessionManager
 from strands.hooks import AfterToolCallEvent, HookProvider, HookRegistry 
 
 
-import logging
-logging.basicConfig(level=logging.DEBUG)
-logging.getLogger("strands").setLevel(logging.DEBUG)
+# Optional Debug Logging
+#import logging
+#logging.basicConfig(level=logging.DEBUG)
+#logging.getLogger("strands").setLevel(logging.DEBUG)
 
 from strands import AgentSkills
 

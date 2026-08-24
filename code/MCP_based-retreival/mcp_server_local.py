@@ -6,15 +6,16 @@ import httpx
 import yaml
 from mcp.server.fastmcp import FastMCP
 
+from dotenv import load_dotenv
+load_dotenv(".env")
 
-
-GITHUB_OWNER = "abhinavcloud"
-GITHUB_REPO = "PersonalWebsite"
-GITHUB_BRANCH = "main"
-BLOG_PATH = "site/blog/posts"
-PROJECTS_PATH = "site/projects/project"
-RESUME_PATH = "site/resume/resume.md"
-GITHUB_API = "https://api.github.com"
+GITHUB_OWNER = os.getenv("GITHUB_OWNER")
+GITHUB_REPO = os.getenv("GITHUB_REPO")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH")
+BLOG_PATH = os.getenv("BLOG_PATH")
+PROJECTS_PATH = os.getenv("PROJECTS_PATH")
+RESUME_PATH = os.getenv("RESUME_PATH")
+GITHUB_API = os.getenv("GITHUB_API")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optional but strongly recommended
 
 # Directory-listing cache: avoids re-fetching every file's content on every
