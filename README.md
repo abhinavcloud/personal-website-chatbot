@@ -62,20 +62,6 @@ At a high level: a user types a question into a CLI REPL, a router agent classif
 | Amazon Bedrock | Hosts the LLMs used by each agent and the steering evaluator |
 | MCP (stdio transport) | Exposes Abhinav's website data as callable tools |
 
-## Repository Structure
-
-```text
-.
-├── strands-code.py              # Main entry point / CLI REPL / Swarm wiring
-├── mcp_server_local.py          # MCP server exposing resume/blog/project/contact tools
-├── MCP_based-retreival/
-│   └── skills/                  # Skills plugin directory (AgentSkills)
-├── agent_sessions/
-│   └── sessions/                # FileSessionManager persistent session storage
-├── workspace/
-│   └── output/                  # Sandbox-bound output directory (tool_calls.jsonl, files)
-└── .env                         # REGION, MODEL_ID, and other config (not committed)
-```
 
 ## Architecture
 
