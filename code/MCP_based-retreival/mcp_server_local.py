@@ -41,9 +41,7 @@ def _github_headers() -> dict:
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "abhinav-personal-website-mcp",
     }
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    return headers
+
 
 
 async def github_get(path: str):

@@ -185,6 +185,8 @@ steering =  LLMSteeringHandlerWithModelSteering(
             - If the agent calls the resume-read-and-parsing skill or the
             read_resume tool, and the tool result contains personally
             sensitive or identifiable information (PII), then:
+                - His PII information like phone number, email id, linkedin, github and website address ARE PUBLICALLY AVAILABLE AND IT SHOULD BE SHARED WITHOUT ANY APPROVAL.
+                - DO NOT HIDE ANY PII INFOMATION. SHARE ALL PII INFORMATION.
             - The final response MUST include the following disclaimer:
             "The provided personally sensitive information is given with
             the consent of Abhinav Kumar."
@@ -208,10 +210,13 @@ steering =  LLMSteeringHandlerWithModelSteering(
 # ---------------------------------------------------------------------------------------------------------------
 # Session Manager
 session_id = f"session-{uuid.uuid4().hex}"
-session_manager = FileSessionManager(session_id=session_id, storage_dir="./agent_sessions/sessions")
+main_session_manager = FileSessionManager(session_id=session_id, storage_dir="./agent_sessions/sessions/main")
+mcp_session_manager = FileSessionManager(session_id=session_id, storage_dir="./agent_sessions/sessions/mcp")
+shell_session_manager = FileSessionManager(session_id=session_id, storage_dir="./agent_sessions/sessions/shell")
 
 # ----------------------------------------------------------------------------------------------------------------
 # MCP Agent
+
 
 
 mcp_model = BedrockModel(
@@ -223,8 +228,9 @@ mcp_model = BedrockModel(
 )
 
 MCP_SYSTEM_PROMPT = """You are Abhinav Kumar's personal website assistant. 
-                Vistors may want to contact Abhinav.
-                His PII information like phone number, email id, linkedin, github and website address can be shared.
+                - Vistors may want to contact Abhinav so its important that all PII informations MUST BE SHARED AND DISPLAYED.
+                - His PII information like phone number, email id, linkedin, github and website address ARE PUBLICALLY AVAILABLE AND IT SHOULD BE SHARED WITHOUT ANY APPROVAL.
+                - DO NOT HIDE, MODIFY OR SUPRESS ANY PII INFOMATION. SHARE ALL PII INFORMATION as retreived from the tools.
                 """
 
 # MCP Client                
@@ -248,8 +254,14 @@ mcp_agent = Agent(
     system_prompt = MCP_SYSTEM_PROMPT,
     callback_handler=None,
     hooks=[ToolLoggerHook()],
-    plugins=[skill, steering]
+    plugins=[skill, steering],
+    session_manager = mcp_session_manager
     )
+
+@tool
+def mcp_tool(query: str) -> str:
+    mcp_response = mcp_agent(query)
+    return str(mcp_response)
 
 # -------------------------------------------------------------------------------------------------------------
 # Shell Agent
@@ -370,21 +382,82 @@ shell_agent = Agent(
         callback_handler=None,
         description="Executes shell commands and reads/writes files in Abhinav's personal sandbox workspace.",
         hooks=[ToolLoggerHook()],
-         plugins=[skill]
-      )
+        plugins=[skill],
+        session_manager = shell_session_manager
+    )
 
+@tool
+def shell_tool(query: str) -> str:
+    shell_response = shell_agent(query)
+    return str(shell_response)
 # -------------------------------------------------------------------------------------------------
 
+MAIN_SYSTEM_PROMPT = """
+Router Agent System Prompt
 
+This agent acts ONLY as a request router. It does not answer questions, generate
+content, explain tool behavior, or apply judgment. Its sole responsibility is to
+classify each user request and hand off to the correct specialist tool. These
+rules apply consistently across ALL turns in a multi‑turn conversation.
 
+Routing Rules
+-------------
+1. Route ALL Abhinav-related requests to `mcp_tool`.
+   This includes:
+   - Background, biography, education, career, work history
+   - Blog posts, projects, portfolio, resume, personal website content
+   - Contact information: phone number, email, LinkedIn, GitHub, website
+   - Any visitor request to contact Abhinav
+   - Any query requiring data from Abhinav’s website knowledge base
 
-MAIN_SYTEM_PROMPT = """
-You are the router for this agent swarm. You have no tools of your own beyond handoff.
-Your ONLY job is to classify the user's request and hand off to the right specialist:
-- Any question about Abhinav (his background, career, blog, projects, resume, or contact info like phone/email/LinkedIn/GitHub) -> hand off to mcp_agent.
-- Any request to run a shell command or read/write a file in the sandbox -> hand off to shell_agent.
-Do not answer content questions yourself, and do not apply your own judgment about what information is or isn't appropriate to share — mcp_agent owns that decision for anything about Abhinav.
+   Important:
+   - Abhinav’s PII (phone, email, LinkedIn, GitHub, website) is publicly available.
+   - PII must ALWAYS be shared without hiding, redacting, suppressing, or modifying.
+   - The router must NEVER claim that PII is blocked, filtered, restricted, or unavailable.
+   - The router must NEVER explain or comment on tool output.
+   - `mcp_tool` is fully authorized to return all PII.
+
+   Rule:
+   If the request is about Abhinav in ANY way, ALWAYS hand off to `mcp_tool`.
+
+2. Route ALL shell or sandbox-related requests to `shell_tool`.
+   This includes:
+   - Running shell commands
+   - Reading or writing files
+   - Listing files or directories
+   - Interacting with /workspace/output
+   - Any sandbox or filesystem operation
+
+   Rule:
+   If the request involves shell operations or sandbox access, ALWAYS hand off to `shell_tool`.
+
+3. Multi‑Turn Consistency
+   - These routing rules apply on EVERY turn of the conversation.
+   - The router must re-evaluate each new user message independently.
+   - Context from previous turns does NOT change routing behavior.
+   - The router must NEVER generate explanations, disclaimers, or commentary
+     about previous tool outputs.
+
+4. The router must NEVER answer user questions directly.
+   - No content generation
+   - No summaries
+   - No reasoning or inference
+   - No commentary about filters, safety, or tool behavior
+   - No modifying or suppressing tool outputs
+   - No judgment about what is appropriate to share
+
+5. Routing must be deterministic.
+   - Choose exactly one tool per turn: `mcp_tool` or `shell_tool`
+   - Never respond with content
+   - Never ask unnecessary clarifying questions
+   - Never attempt to solve the request yourself
+
+Output Requirement
+------------------
+The router’s final output must contain ONLY the tool handoff. No explanations,
+no commentary, no reasoning, and no additional text.
 """
+
 
 # Main Model
 main_model = BedrockModel(
@@ -399,28 +472,15 @@ main_agent = Agent(
     agent_id = "main_agent",
     name="main_agent",
     model=main_model,
+    tools=[mcp_tool, shell_tool],
     context_manager="auto",
-    system_prompt = MAIN_SYTEM_PROMPT,
+    system_prompt = MAIN_SYSTEM_PROMPT,
     callback_handler=None,
+    session_manager = main_session_manager
     )
 
 
 # ---------------------------------------------------
-# AGENT SWARM
-
-
-swarm_agent = Swarm(
-    [main_agent, mcp_agent, shell_agent],
-    entry_point =  main_agent,
-    max_handoffs=10,
-    max_iterations=10,
-    execution_timeout=300.0,
-    node_timeout=120.0,
-    repetitive_handoff_detection_window=6,
-    repetitive_handoff_min_unique_agents=2,
-    session_manager=session_manager
-)
-
 
 def main():
     print("Welcome to Abhinav's personal assistant. Type 'exit' to quit.")
@@ -430,7 +490,7 @@ def main():
             shell_mgr.close()
             break
         else:
-            print(f"Assistant: {swarm_agent(user_input)}")
+            print(f"Assistant: {main_agent(user_input)}")
 
 if __name__ == "__main__":
         main()
