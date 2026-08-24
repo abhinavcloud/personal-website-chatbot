@@ -43,7 +43,7 @@ This project combines several building blocks into a single conversational assis
 - **Shell sandbox tools** — a constrained, bound shell environment for file and command operations
 - **Steering & Skills plugins** — response evaluation/guidance and pluggable extra tools/behaviors
 - **Amazon Bedrock LLM models** — the underlying models for each agent
-- **A Swarm router** — coordinates handoffs between agents based on user intent
+- **A Main Agent Router** — coordinates handoffs between agents (as tools) based on user intent
 - **Persistent session management** — conversation state saved across turns
 - **Tool logging hooks** — an audit trail of every tool call
 
