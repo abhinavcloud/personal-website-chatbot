@@ -19,9 +19,9 @@ from strands.hooks import AfterToolCallEvent, HookProvider, HookRegistry
 
 
 # Optional Debug Logging
-#import logging
-#logging.basicConfig(level=logging.DEBUG)
-#logging.getLogger("strands").setLevel(logging.DEBUG)
+import logging
+logging.basicConfig(level=logging.DEBUG)
+logging.getLogger("strands").setLevel(logging.DEBUG)
 
 from strands import AgentSkills
 
