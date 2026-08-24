@@ -16,7 +16,7 @@ BLOG_PATH = os.getenv("BLOG_PATH")
 PROJECTS_PATH = os.getenv("PROJECTS_PATH")
 RESUME_PATH = os.getenv("RESUME_PATH")
 GITHUB_API = os.getenv("GITHUB_API")
-#GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # optional but strongly recommended
+
 
 # Directory-listing cache: avoids re-fetching every file's content on every
 # list/first/last/latest/oldest call within a session. Content rarely changes
