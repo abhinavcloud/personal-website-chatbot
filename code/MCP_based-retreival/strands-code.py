@@ -4,34 +4,34 @@ import boto3
 import json
 from datetime import datetime, timezone
 import uuid
-import strands_shell
 import concurrent.futures
 
 
-from mcp import StdioServerParameters, stdio_client
+from mcp import StdioServerParameters, stdio_client # STDIO CLIENT
 
 from strands import Agent
-from strands.tools.mcp import MCPClient
-from strands import Agent, tool
-from strands.models import BedrockModel
-from strands.session.file_session_manager import FileSessionManager
-from strands.hooks import AfterToolCallEvent, HookProvider, HookRegistry 
+from strands.tools.mcp import MCPClient # MCP Client
+from strands import Agent, tool # Agent and Tools 
+from strands.models import BedrockModel # Models
+import strands_shell # SHELL Tools
+from strands.session.file_session_manager import FileSessionManager # Session Manager 
+from strands.hooks import AfterToolCallEvent, HookProvider, HookRegistry # Hooks
 
 
 # Optional Debug Logging
-import logging
-logging.basicConfig(level=logging.DEBUG)
-logging.getLogger("strands").setLevel(logging.DEBUG)
+#import logging
+#logging.basicConfig(level=logging.DEBUG)
+#logging.getLogger("strands").setLevel(logging.DEBUG)
 
-from strands import AgentSkills
+from strands import AgentSkills # SKills Plugin
 
-from strands.vended_plugins.steering import LLMSteeringHandler, Proceed, Guide
-from strands.vended_plugins.steering.handlers.llm.llm_handler import _LLMSteering
+from strands.vended_plugins.steering import LLMSteeringHandler, Proceed, Guide # Steering Plugins
+from strands.vended_plugins.steering.handlers.llm.llm_handler import _LLMSteering # Steering Plugins
 
-from strands.multiagent import Swarm
 
 from dotenv import load_dotenv
-load_dotenv(".env")
+load_dotenv(".env") # Loading Env Variables
+
 REGION = os.getenv("REGION")
 MODEL_ID = os.getenv("MODEL_ID")
 SERVER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server_local.py")
