@@ -316,8 +316,16 @@ pip install strands boto3 python-dotenv
 Create a `.env` file in the project root:
 
 ```env
-REGION=us-east-1
+REGION= <your aws region>
 MODEL_ID=<your-bedrock-model-id>
+GITHUB_OWNER = <github owner to connect to>
+GITHUB_REPO = <github repo>
+GITHUB_BRANCH = <github branch>
+BLOG_PATH = <github repo path 1> ## Optional
+PROJECTS_PATH = <github repo path2> ## Optional
+RESUME_PATH = <github repo path 3> ## Optional
+GITHUB_API = "https://api.github.com"
+GITHUB_TOKEN = <TOKEN ID> # Optional to remove rate limiting by GITHUB API for multiple api calls.
 ```
 
 Also confirm the following paths are set correctly before running:
