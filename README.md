@@ -13,6 +13,7 @@ A multi-agent architecture powering Abhinav Kumar's personal website assistant �
 - [Architecture](#architecture)
   - [Architecture Diagram](#architecture-diagram)
   - [Mermaid Diagram](#mermaid-diagram)
+  - [Important Architecture Update: Swarm Removed](#important-architecture-update-swarm-removed)
 - [Agent Roles](#agent-roles)
   - [main_agent — Router](#main_agent--router)
   - [mcp_agent — Website Knowledge Agent](#mcp_agent--website-knowledge-agent)
@@ -21,7 +22,7 @@ A multi-agent architecture powering Abhinav Kumar's personal website assistant �
 - [Steering & Skills](#steering--skills)
 - [Tool Logging](#tool-logging)
 - [Session Management](#session-management)
-- [Swarm Configuration](#swarm-configuration)
+- [Swarm Configuration (Deprecated)](#swarm-configuration-Deprecated)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
@@ -144,6 +145,29 @@ flowchart TD
         TL
     end
 ```
+
+### Important Architecture Update: Swarm Removed
+
+The initial version of this project used a Strands Swarm to orchestrate multiple agents.
+However, Swarm was removed because it does not support multi‑turn conversational persistence.
+
+Swarm’s shared context and working memory only exist during a single execution.
+Even with a session_manager, Swarm only resumes interrupted tasks, not completed turns.
+After each turn, Swarm resets to a blank state, and individual agent histories are not persisted.
+
+This limitation is documented in Strands issue #867, where “Iterative Refinement” shipped only for crash‑resume scenarios, not multi‑turn conversations.
+
+Because this assistant requires persistent MCP state, persistent shell state, stable agent IDs, and multi‑turn continuity, Swarm was replaced with a more reliable architecture:
+
+A single orchestrator agent (main_agent)
+
+Specialist agents (mcp_agent, shell_agent) used as tools
+
+Persistent session managers for each agent
+
+Deterministic routing logic
+
+This architecture provides full multi‑turn memory, stable tool behavior, and predictable routing — making it the correct approach for conversational assistants built with Strands.
 
 ## Agent Roles
 
@@ -274,7 +298,13 @@ Uses a separate Bedrock model (`mistral.mistral-large-2402-v1:0`) as an evaluato
 - `storage_dir = "./agent_sessions/sessions"`
 - Used by the `Swarm` to persist conversation/session state across turns
 
-## Swarm Configuration
+## Swarm Configuration (Deprecated)
+
+> **Note:** The Swarm architecture is no longer used in this project.
+> It was removed because Strands Swarm does not support multi‑turn
+> conversational persistence. The assistant now uses a single
+> orchestrator agent (`main_agent`) with specialist agents (`mcp_agent`,
+> `shell_agent`) invoked as tools.
 
 | Setting | Value |
 |---|---|
