@@ -10,7 +10,6 @@ A multi-agent architecture powering Abhinav Kumar's personal website assistant �
 
 - [Overview](#overview)
 - [Tech Stack](#tech-stack)
-- [Repository Structure](#repository-structure)
 - [Architecture](#architecture)
   - [Architecture Diagram](#architecture-diagram)
   - [Mermaid Diagram](#mermaid-diagram)
@@ -32,9 +31,6 @@ A multi-agent architecture powering Abhinav Kumar's personal website assistant �
 - [Security & Privacy Notes](#security--privacy-notes)
 - [Troubleshooting](#troubleshooting)
 - [Roadmap Ideas](#roadmap-ideas)
-- [Contributing](#contributing)
-- [License](#license)
-
 ---
 
 ## Overview
@@ -60,7 +56,7 @@ At a high level: a user types a question into a CLI REPL, a router agent classif
 | `boto3` | AWS SDK, used for Bedrock model access |
 | `python-dotenv` | Loads environment variables from `.env` |
 | Amazon Bedrock | Hosts the LLMs used by each agent and the steering evaluator |
-| MCP (stdio transport) | Exposes Abhinav's website data as callable tools |
+| MCP (stdio transport) | Exposes  website data as callable tools |
 
 
 ## Architecture
@@ -82,24 +78,24 @@ At a high level: a user types a question into a CLI REPL, a router agent classif
                  |                                                 |
                  v                                                 v
   +-----------------------------+                   +-----------------------------+
-  |          mcp_agent            |                   |         shell_agent          |
+  |          mcp_agent            |                   |         shell_agent   n       |
   |  - BedrockModel (MODEL_ID)    |                   |  - BedrockModel (MODEL_ID)    |
   |  - MCPClient (stdio)          |                   |  - Shell tools:               |
   |  - Skills plugin              |                   |      • sandbox_shell          |
   |  - Steering plugin            |                   |      • sandbox_write          |
   |  - ToolLoggerHook             |                   |      • sandbox_read           |
   +--------------+----------------+                   |      • sandbox_list           |
-                 |                                     |  - ToolLoggerHook             |
-                 v                                     +--------------+----------------+
+                 |                                    |  - ToolLoggerHook             |
+                 v                                    +--------------+----------------+
   +-----------------------------+                                     |
   |     mcp_server_local.py       |                                     v
   |  (MCP subprocess via stdio)   |                   +-----------------------------+
   |  - Tools: resume/blogs/etc.   |                   |         ShellManager           |
   |  - Reads Abhinav's content    |                   |  - strands_shell.Shell         |
   +-----------------------------+                     |  - Bind:                       |
-                                                        |    OUTPUT_PATH ->              |
-                                                        |    /workspace/output           |
-                                                        +--------------+----------------+
+                                                      |    OUTPUT_PATH ->              |
+                                                      |    /workspace/output           |
+                                                      +--------------+----------------+
                                                                        |
                                                                        v
                                                         +-----------------------------+
@@ -109,8 +105,8 @@ At a high level: a user types a question into a CLI REPL, a router agent classif
                                                         +-----------------------------+
 
                           +-----------------------------+
-                          |      FileSessionManager        |
-                          |    ./agent_sessions/sessions    |
+                          |      FileSessionManager      |
+                          |    ./agent_sessions/sessions |
                           +-----------------------------+
 
                           +-----------------------------+
