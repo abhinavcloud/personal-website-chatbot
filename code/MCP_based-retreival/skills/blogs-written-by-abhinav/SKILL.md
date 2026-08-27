@@ -1,11 +1,11 @@
 ---
 name: blogs-written-by-abhinav
-description: Extract all information related to abhinav blogs that he has published. 
-allowed-tools: list_projects, get_first_project, get_last_project, get_latest_projects, get_oldest_projects, read_projects
+description: Retrieve all information about blogs published by Abhinav.
+allowed-tools: list_blogs, get_first_blog, get_last_blog, get_latest_blogs, get_oldest_blogs, read_blog
 ---
-# Abhinav blog Details
+# Abhinav Blog Details
 
-1. list_blogs() → browse all blogs.
+1. list_blogs() → list all blogs.
 2. get_first_blog() → oldest blog.
 3. get_last_blog() → most recent blog.
 4. get_latest_blogs(n) → newest n blogs.

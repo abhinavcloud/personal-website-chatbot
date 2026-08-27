@@ -1,11 +1,11 @@
 ---
 name: project-written-by-abhinav
-description: Extract all information related to abhinav projects that he has published. 
+description: Retrieve all information about projects created and published by Abhinav.
 allowed-tools: list_projects, get_first_project, get_last_project, get_latest_projects, get_oldest_projects, read_projects
 ---
 # Abhinav Project Details
 
-1. list_projects() → browse all projects.
+1. list_projects() → list all projects.
 2. get_first_project() → oldest project.
 3. get_last_project() → most recent project.
 4. get_latest_projects(n) → newest n projects.
