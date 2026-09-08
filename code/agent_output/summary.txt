@@ -1,0 +1,10 @@
+- Summary:
+Abhinav's latest blog explores the cost implications of using RDS Proxy with Aurora Serverless v2. The blog covers:
+
+- **Introduction:** Discusses how RDS Proxy changes the economics of Aurora Serverless v2 by affecting the proxy pricing and auto-pause behavior.
+- **RDS Proxy Functionality:** RDS Proxy manages database connections, preserves connectivity during topology changes, and supports IAM-based authentication.
+- **Cost Implications:** Explains why the cost profile changes with RDS Proxy and how it affects side projects versus production workloads.
+- **Reconfiguration Options:** Analyzes realistic reconfiguration options after integrating RDS Proxy into Lambda IAM policies, security groups, and environment variables.
+
+**Conclusion:**
+The blog aims to make the trade-offs explicit regarding RDS Proxy usage in Aurora Serverless v2, distinguishing between theoretical benefits and operational realities. It emphasizes understanding the cost and operational impacts before adopting RDS Proxy in production environments.

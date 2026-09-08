@@ -574,6 +574,7 @@ data "aws_iam_policy_document" "lambda_s3_access_source_dest_bucket" {
     resources = [
       var.frontend_bucket_arn,
       "${var.frontend_bucket_arn}/*"
+      
     ]
   }
 
