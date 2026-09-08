@@ -7,5 +7,6 @@ variable "frontend_bucket_arn" {
 variable "frontend_bucket_name" {
   type        = string
   description = "Name of the frontend bucket"
+  
 }
 
