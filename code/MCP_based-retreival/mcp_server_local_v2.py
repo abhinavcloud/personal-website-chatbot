@@ -32,16 +32,12 @@ mcp = FastMCP(
 )
 
 
-
-
-
 def _github_headers() -> dict:
     return {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "abhinav-personal-website-mcp",
     }
-
 
 
 async def github_get(path: str):
@@ -85,6 +81,7 @@ async def jsdelivr_get_raw_content(path: str) -> str:
     response.raise_for_status()
     return response.text
 
+
 async def github_get_raw_content(path: str) -> str:
     """
     Fetch a file's content as text. Tries jsDelivr first (no rate limit
@@ -123,12 +120,32 @@ def strip_frontmatter(content: str) -> str:
     return FRONTMATTER_RE.sub("", content, count=1).lstrip("\n")
 
 
+def _first_present(metadata: dict, *keys, default=""):
+    """
+    Return the value of the first key present (and non-empty/non-None) in
+    metadata. Frontmatter field names drift between "email"/"emails",
+    "phone"/"telephone"/"mobile", etc. Silently returning "" on a name
+    mismatch is how the earlier version produced empty/undisclosed contact
+    fields even when the resume actually had the data under a slightly
+    different key. This does not fabricate anything - it only widens the
+    set of accepted spellings for the SAME field.
+    """
+    for key in keys:
+        if key in metadata and metadata[key] not in (None, "", []):
+            return metadata[key]
+    return default
+
+
 async def list_markdown_entries(dir_path: str, force_refresh: bool = False) -> list[dict]:
     """
     List markdown files in a GitHub directory, fetching and parsing
     each file's frontmatter metadata (title, subtitle, date, readingTime,
     tags, icon). Results are cached per directory for CACHE_TTL_SECONDS to
     avoid redundant GitHub API calls within a session.
+
+    NOTE: this returns METADATA ONLY, never the article body. Callers that
+    need to summarize, quote, or describe the actual content of an entry
+    MUST separately call read_blog / read_projects with the entry's "path".
     """
     now = time.time()
     if not force_refresh:
@@ -161,6 +178,7 @@ async def list_markdown_entries(dir_path: str, force_refresh: bool = False) -> l
             "readingTime": metadata.get("readingTime", ""),
             "tags": metadata.get("tags", []),
             "icon": metadata.get("icon", ""),
+            "has_full_content": True,  # signal to the model: call read_blog/read_projects for the body
         })
 
     # Newest first; entries with no/unparsable date sort last.
@@ -240,9 +258,13 @@ async def list_blogs() -> list[dict]:
     including title, subtitle, date, reading time, tags, and icon
     parsed from each post's frontmatter. Sorted newest first.
 
+    This returns METADATA ONLY - no article body. To summarize, quote, or
+    describe what a blog actually says, you must additionally call
+    read_blog(path) with the "path" field from the entry you want.
+
     Use this for browsing/listing all blogs. For "first/oldest blog" or
     "most recent N blogs" questions, prefer get_first_blog / get_last_blog /
-    get_latest_blogs / get_oldest_blogs instead — do not compute min/max
+    get_latest_blogs / get_oldest_blogs instead - do not compute min/max
     yourself from this list.
     """
     return await list_markdown_entries(BLOG_PATH)
@@ -253,8 +275,11 @@ async def get_first_blog() -> dict:
     """
     Return the single oldest blog (the first one Abhinav ever wrote),
     determined by comparing dates across ALL blogs, not just recently
-    discussed ones. Always use this tool — do not infer the first blog
+    discussed ones. Always use this tool - do not infer the first blog
     from a partial list already seen in conversation.
+
+    Returns METADATA ONLY. Call read_blog(path) on the returned "path" if
+    you need to summarize, quote, or describe the actual article content.
     """
     entries = await list_markdown_entries(BLOG_PATH)
     return _pick_extreme(entries, newest=False)
@@ -265,6 +290,9 @@ async def get_last_blog() -> dict:
     """
     Return the single most recent blog Abhinav has written, determined
     by comparing dates across ALL blogs.
+
+    Returns METADATA ONLY. Call read_blog(path) on the returned "path" if
+    you need to summarize, quote, or describe the actual article content.
     """
     entries = await list_markdown_entries(BLOG_PATH)
     return _pick_extreme(entries, newest=True)
@@ -276,6 +304,9 @@ async def get_latest_blogs(n: int = 4) -> list[dict]:
     Return the n most recent blogs, newest first, computed by sorting
     ALL blogs by date. Use this instead of manually picking from list_blogs
     output.
+
+    Returns METADATA ONLY per entry. Call read_blog(path) on a specific
+    entry's "path" if you need to summarize, quote, or describe its content.
     """
     entries = await list_markdown_entries(BLOG_PATH)
     return _top_n(entries, n, newest=True)
@@ -286,6 +317,9 @@ async def get_oldest_blogs(n: int = 4) -> list[dict]:
     """
     Return the n oldest blogs, oldest first, computed by sorting ALL
     blogs by date.
+
+    Returns METADATA ONLY per entry. Call read_blog(path) on a specific
+    entry's "path" if you need to summarize, quote, or describe its content.
     """
     entries = await list_markdown_entries(BLOG_PATH)
     return _top_n(entries, n, newest=False)
@@ -294,9 +328,15 @@ async def get_oldest_blogs(n: int = 4) -> list[dict]:
 @mcp.tool()
 async def read_blog(path: str) -> dict:
     """
-    Read the complete contents of a blog, including its frontmatter
-    metadata (title, subtitle, date, readingTime, tags, icon) and the
-    markdown body with the frontmatter stripped out.
+    Read the COMPLETE contents of a single blog post, including its
+    frontmatter metadata (title, subtitle, date, readingTime, tags, icon)
+    and the full markdown body (frontmatter stripped out) in the
+    "content" field.
+
+    This is the ONLY tool that returns actual article text. Call this
+    whenever the user wants a summary, description, quote, or the full
+    content of a specific blog - list_blogs/get_last_blog/etc. do not
+    contain the body and are not a substitute for this call.
     """
     return await read_markdown_entry(path, BLOG_PATH, "blog")
 
@@ -312,6 +352,10 @@ async def list_projects() -> list[dict]:
     including title, subtitle, date, reading time, tags, and icon
     parsed from each project's frontmatter. Sorted newest first.
 
+    This returns METADATA ONLY - no project body. To summarize, quote, or
+    describe what a project actually says, you must additionally call
+    read_projects(path) with the "path" field from the entry you want.
+
     For "first/oldest project" or "most recent N projects" questions,
     prefer get_first_project / get_last_project / get_latest_projects /
     get_oldest_projects instead of computing min/max yourself.
@@ -324,6 +368,9 @@ async def get_first_project() -> dict:
     """
     Return the single oldest project (the first one Abhinav worked on),
     determined by comparing dates across ALL projects.
+
+    Returns METADATA ONLY. Call read_projects(path) on the returned "path"
+    if you need to summarize, quote, or describe the actual project content.
     """
     entries = await list_markdown_entries(PROJECTS_PATH)
     return _pick_extreme(entries, newest=False)
@@ -334,6 +381,9 @@ async def get_last_project() -> dict:
     """
     Return the single most recent project, determined by comparing
     dates across ALL projects.
+
+    Returns METADATA ONLY. Call read_projects(path) on the returned "path"
+    if you need to summarize, quote, or describe the actual project content.
     """
     entries = await list_markdown_entries(PROJECTS_PATH)
     return _pick_extreme(entries, newest=True)
@@ -341,14 +391,24 @@ async def get_last_project() -> dict:
 
 @mcp.tool()
 async def get_latest_projects(n: int = 4) -> list[dict]:
-    """Return the n most recent projects, newest first."""
+    """
+    Return the n most recent projects, newest first.
+
+    Returns METADATA ONLY per entry. Call read_projects(path) on a specific
+    entry's "path" if you need to summarize, quote, or describe its content.
+    """
     entries = await list_markdown_entries(PROJECTS_PATH)
     return _top_n(entries, n, newest=True)
 
 
 @mcp.tool()
 async def get_oldest_projects(n: int = 4) -> list[dict]:
-    """Return the n oldest projects, oldest first."""
+    """
+    Return the n oldest projects, oldest first.
+
+    Returns METADATA ONLY per entry. Call read_projects(path) on a specific
+    entry's "path" if you need to summarize, quote, or describe its content.
+    """
     entries = await list_markdown_entries(PROJECTS_PATH)
     return _top_n(entries, n, newest=False)
 
@@ -356,9 +416,15 @@ async def get_oldest_projects(n: int = 4) -> list[dict]:
 @mcp.tool()
 async def read_projects(path: str) -> dict:
     """
-    Read the complete contents of a project, including its frontmatter
-    metadata (title, subtitle, date, readingTime, tags, icon) and the
-    markdown body with the frontmatter stripped out.
+    Read the COMPLETE contents of a single project, including its
+    frontmatter metadata (title, subtitle, date, readingTime, tags, icon)
+    and the full markdown body (frontmatter stripped out) in the
+    "content" field.
+
+    This is the ONLY tool that returns actual project text. Call this
+    whenever the user wants a summary, description, quote, or the full
+    content of a specific project - list_projects/get_last_project/etc.
+    do not contain the body and are not a substitute for this call.
     """
     return await read_markdown_entry(path, PROJECTS_PATH, "project")
 
@@ -367,28 +433,18 @@ async def read_projects(path: str) -> dict:
 # Resume tool
 # ---------------------------------------------------------------------------
 
-
-# @mcp.tool()
-# async def read_resume() -> dict:
-#    """
-#    Read the complete contents of Abhinav's resume, including his contact details, LinkedIn profile,
-#    personal website, GitHub profile, skills, certifications, projects, work experience, and companies
-#    he has worked for.
-#    """
-#    content = await github_get_raw_content(RESUME_PATH)
-#    metadata = parse_frontmatter(content)
-#    body = strip_frontmatter(content)
-
-#    return {
-#        "path": RESUME_PATH,
-#        "content": body,
-#    }
-#'''
 @mcp.tool()
 async def read_resume() -> dict:
     """
-    Read Abhinav's resume. Returns structured contact fields separately
-    from the free-text body (skills, experience, projects, etc.).
+    Read Abhinav's resume. Returns structured contact fields (name, title,
+    location, phone, email, linkedin, github, website) separately from the
+    free-text body (skills, experience, projects, etc.).
+
+    Call this tool - and quote its "contact" fields verbatim - for ANY
+    question about Abhinav's phone number, email address, LinkedIn,
+    GitHub, or personal website. Never answer a contact-info question
+    from memory or by guessing/pattern-completing a number or address;
+    always ground the answer in this tool's output.
     """
     content = await github_get_raw_content(RESUME_PATH)
     metadata = parse_frontmatter(content)
@@ -397,17 +453,19 @@ async def read_resume() -> dict:
     return {
         "path": RESUME_PATH,
         "contact": {
-            "name": metadata.get("name", ""),
-            "title": metadata.get("title", ""),
-            "location": metadata.get("location", ""),
-            "phone": metadata.get("phone", ""),
-            "email": metadata.get("email", []),
-            "linkedin": metadata.get("linkedin", ""),
-            "github": metadata.get("github", ""),
-            "website": metadata.get("website", ""),
+            "name": _first_present(metadata, "name", "full_name"),
+            "title": _first_present(metadata, "title", "role", "headline"),
+            "location": _first_present(metadata, "location", "city"),
+            "phone": _first_present(metadata, "phone", "telephone", "mobile", "phone_number"),
+            "email": _first_present(metadata, "email", "emails", "email_address", default=[]),
+            "linkedin": _first_present(metadata, "linkedin", "linkedIn", "linkedin_url"),
+            "github": _first_present(metadata, "github", "github_url"),
+            "website": _first_present(metadata, "website", "site", "url"),
         },
-        "content": body,   # skills/experience/projects prose, no contact data duplicated here
+        # skills/experience/projects prose; contact data intentionally not duplicated here
+        "content": body,
     }
+
 
 if __name__ == "__main__":
 
