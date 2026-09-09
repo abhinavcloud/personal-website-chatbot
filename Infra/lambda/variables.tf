@@ -1,0 +1,13 @@
+variable "project_name" {type = string}
+variable "blog_zip_path" {type = string}
+variable "projects_zip_path" {type = string}
+variable "resume_zip_path" {type = string}
+variable "github_owner"  {type = string}
+variable "github_repo" {type = string}
+variable "github_branch" {type = string}
+variable "resume_path" {type = string}
+variable "blog_path" {type = string}
+variable "projects_path" {type = string}
+variable "lambda_exec" {type = string}
+variable "github_api" {type = string}
+variable "jsdeliver_base" {type = string}

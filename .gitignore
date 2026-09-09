@@ -17,6 +17,7 @@ function.zip
 code/agent_output
 code/agent_sessions
 code/MCP_based-retreival/mcp_server_lambda.py
+requirements.txt
 
 
 
