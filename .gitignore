@@ -17,7 +17,12 @@ function.zip
 code/agent_output
 code/agent_sessions
 code/MCP_based-retreival/mcp_server_lambda.py
-requirements.txt
+code/requirements.txt
+personalagent/app/MyAgent/src/
+personalagent/app/MyAgent/.venv
+personalagent/app/MyAgent/.python-version
+personalagent/app/MyAgent/uv.lock
+
 
 
 

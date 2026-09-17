@@ -1,0 +1,88 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "personalagent",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "personalagent"
+  },
+  "runtimes": [
+    {
+      "name": "MyAgent",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/MyAgent/",
+      "runtimeVersion": "PYTHON_3_14",
+      "envVars": [
+        {
+          "name": "GATEWAY_URL",
+          "value": "https://personal-website-agent-gateway-1ngr1vukxh.gateway.bedrock-agentcore.ap-south-1.amazonaws.com/mcp"
+        },
+        {
+          "name": "STEERING_MODEL_ID",
+          "value": "us.meta.llama4-maverick-17b-instruct-v1:0"
+        },
+        {
+          "name": "MODEL_ID",
+          "value": "arn:aws:bedrock:ap-south-1:806685982094:application-inference-profile/tyw6xeigdxzk"
+        },
+        {
+          "name": "REGION",
+          "value": "ap-south-1"
+        },
+        {
+          "name": "STEERING_REGION",
+          "value": "us-east-1"
+        },
+        {
+          "name": "AGENTCORE_MEMORY_ID",
+          "value": "arn:aws:bedrock-agentcore:ap-south-1:806685982094:memory/personalagent_personal_chatbot_memory-4QAJtlG3x2"
+        }
+      ],
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP"
+    }
+  ],
+  "memories": [
+    {
+      "name": "personal_chatbot_memory",
+      "eventExpiryDuration": 7,
+      "strategies": [
+        {
+          "type": "SEMANTIC",
+          "namespaceTemplates": [
+            "/users/{actorId}/facts"
+          ]
+        },
+        {
+          "type": "SUMMARIZATION",
+          "namespaceTemplates": [
+            "/summaries/{actorId}/{sessionId}"
+          ]
+        }
+      ]
+    }
+  ],
+  "knowledgeBases": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [
+    {
+      "name": "personal-website-agent-gateway",
+      "resourceName": "personal-website-agent-gateway",
+      "targets": [],
+      "authorizerType": "NONE",
+      "enableSemanticSearch": false,
+      "exceptionLevel": "NONE",
+      "executionRoleArn": "arn:aws:iam::806685982094:role/personal-website-agent-gateway-exec"
+    }
+  ],
+  "policyEngines": [],
+  "configBundles": [],
+  "abTests": [],
+  "harnesses": [],
+  "datasets": [],
+  "payments": []
+}

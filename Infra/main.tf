@@ -2,6 +2,21 @@ data "aws_region" "current" {}
 
 data "aws_availability_zones" "az" { state = "available" }
 
+data "aws_caller_identity" "current" {}
+
+module "iam" {
+  source       = "./iam/"
+  project_name = var.project_name
+  lambda_resume = module.lambda.resume_arn
+  lambda_blog = module.lambda.blog_arn
+  lambda_projects = module.lambda.projects_arn
+  region = data.aws_region.current.region
+  account_id = data.aws_caller_identity.current.account_id
+
+  
+}
+
+
 module "lambda" {
   source            = "./lambda/"
   project_name      = var.project_name
@@ -20,8 +35,14 @@ module "lambda" {
 
 }
 
-module "iam" {
-  source       = "./iam/"
+
+module "agentcore-gateway" {
+  source       = "./agentcore-gateway"
   project_name = var.project_name
+  gateway_exec = module.iam.gateway_exec
+  lambda_resume = module.lambda.resume_arn
+  lambda_blog = module.lambda.blog_arn
+  lambda_projects = module.lambda.projects_arn
+
 }
 
