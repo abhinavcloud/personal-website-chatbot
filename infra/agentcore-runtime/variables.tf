@@ -1,0 +1,13 @@
+variable "runtime_role" {type = string}
+variable "container_uri" {type = string}
+variable "model_id" {type = string}
+variable "steering_model_id" {type = string}
+variable "region" {type = string}
+variable "steering_region" {type = string}
+variable "gateway_url" {type = string}
+variable "memory_id" {type = string}
+variable "cognito_app_client_id" {type = string}
+variable "cognito_discovery_url" {type = string}
+variable "cognito_issuer_url" {type = string}
+variable "cognito_userinfo_url" {type = string}
+variable "mail_table_name" {type = string}

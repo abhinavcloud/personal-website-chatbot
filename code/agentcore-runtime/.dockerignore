@@ -1,0 +1,29 @@
+# Local environment files and credentials must never enter the build context.
+**/.env
+**/.env.*
+**/.aws
+**/*.pem
+**/*.key
+
+**/.venv
+**/venv
+
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+**/.git
+**/.gitignore
+
+# Local session data, backup configuration, and editor/build metadata.
+agent_sessions/
+**/*.bkp
+**/*.bak
+.idea/
+.vscode/
+Dockerfile
+.dockerignore
+README.Docker.md

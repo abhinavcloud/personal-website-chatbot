@@ -1,0 +1,24 @@
+# Amazon Bedrock 101 Demo Requirements
+# Install with: pip install -r requirements.txt
+
+# AWS SDK for Python (Boto3)
+boto3>=1.35.0
+
+# AWS SDK Core
+botocore>=1.35.0
+
+# Strands Agents SDK (for v3 capstone example)
+# Requires Python 3.10+
+strands-agents>=0.1.0
+strands-agents-tools>=0.1.0
+bedrock-agentcore[strands-agents]
+
+# MCP 
+mcp[cli]
+httpx
+mcp-proxy-for-aws
+
+
+PyJWT[crypto]>=2.10,<3
+uuid
+

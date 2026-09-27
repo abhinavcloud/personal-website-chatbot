@@ -1,0 +1,14 @@
+variable "project_name" {type = string}
+variable "lambda_blog" {type = string}
+variable "lambda_projects" {type = string}
+variable "lambda_resume" {type = string}
+variable "region" {type = string}
+variable "account_id" {type = string}
+variable "ecr_arn" {type = string}
+variable "gateway_arn" {type = string}
+variable "memory_arn" {type = string}
+variable "model_id" {type = string}
+variable "ses_arn" {type = string}
+variable "recipient_email" {type = string}
+variable "lambda_email" {type = string}
+variable "mail_table_arn" {type = string}
