@@ -8,20 +8,20 @@ This repository contains the AWS backend, Lambda deployment packages, containeri
 
 ## Product capabilities and scope
 
-- **Profile discovery:** answer questions about the owner's experience, skills, résumé, and published contact information.
+- **Profile discovery:** answer questions about the owner's experience, skills, rï¿½sumï¿½, and published contact information.
 - **Project and repository discovery:** explain projects from GitHub-hosted descriptions and share repository links included in that content.
 - **Published content:** list and summarize blog posts and project write-ups using retrieved source material.
 - **Conversational contact:** compose drafts and submit messages to the owner's configured email address through Amazon SES, using the signed-in visitor's verified email as reply-to.
 - **Conversation continuity:** keep user-scoped facts and session summaries through AgentCore Memory.
 - **Self-hosted deployment:** configure your own AWS account, models, content repository, identity provider credentials, and email identities.
 
-The current content tools read a configured public GitHub repository containing résumé/profile Markdown, project descriptions, and blog posts. They do not automatically enumerate every repository on a GitHub account, index arbitrary source code, or call the GitHub user-profile API. Include repository links and descriptions in your content, or extend the retrieval Lambdas and Gateway tool schemas for direct account/repository discovery. Email integration currently supports outbound contact through SES; it does not read or synchronize an inbox.
+The current content tools read a configured public GitHub repository containing rï¿½sumï¿½/profile Markdown, project descriptions, and blog posts. They do not automatically enumerate every repository on a GitHub account, index arbitrary source code, or call the GitHub user-profile API. Include repository links and descriptions in your content, or extend the retrieval Lambdas and Gateway tool schemas for direct account/repository discovery. Email integration currently supports outbound contact through SES; it does not read or synchronize an inbox.
 
 ## Adapt the assistant to your profile
 
 The deployment configuration is reusable, but the checked-in agent prompts and skills still contain the original example owner's identity. Complete these steps when deploying for another person:
 
-1. **Prepare your content.** Choose a public GitHub repository and add your résumé/profile, project descriptions, and optional blog posts as Markdown with the metadata expected by the retrieval packages. Include links to the repositories you want visitors to discover.
+1. **Prepare your content.** Choose a public GitHub repository and add your rï¿½sumï¿½/profile, project descriptions, and optional blog posts as Markdown with the metadata expected by the retrieval packages. Include links to the repositories you want visitors to discover.
 2. **Configure your deployment.** Set the GitHub owner, repository, branch, content paths, AWS image/model settings, Google OAuth credentials, and email identities in `infra/terraform.tfvars` using the template below.
 3. **Customize the assistant identity.** Update owner names, profile/contact matching patterns, prompts, agent descriptions, and user-facing messages in `code/agentcore-runtime/main-v2.py`. Review all files under `code/agentcore-runtime/skills/` and the tool descriptions in `infra/agentcore-gateway/`. Some skill directory names include the example owner's name; if renaming them, update their front-matter names and every Python/prompt reference together.
 4. **Connect your email destination.** Set `assistant_email` to the SES sender and `recipient_email` to the address where you want to receive visitor messages. Verify the required SES identities. Each deployment currently has one configured recipient.
@@ -59,13 +59,13 @@ flowchart TD
 3. AgentCore's JWT authorizer checks the token. Application code also validates the JWT signature, issuer, expiry, token type, and Cognito app client. The token subject identifies the user.
 4. A main Strands agent coordinates conversation, a profile agent retrieves the configured profile and project content through Gateway tools, and an email agent composes messages. A steering model and hooks check selected response/tool behavior.
 5. AgentCore Memory stores conversation events and retrieves user facts and session summaries. DynamoDB stores email drafts and operation records; the email Lambda uses send records to limit duplicate submissions.
-6. Email uses the configured SES sender and profile owner’s destination address. The runtime gets the signed-in user's verified email from Cognito UserInfo and supplies it as the reply-to address.
+6. Email uses the configured SES sender and profile ownerï¿½s destination address. The runtime gets the signed-in user's verified email from Cognito UserInfo and supplies it as the reply-to address.
 
 The runtime uses public networking. Its calls to Gateway use AWS IAM authentication; client calls to the runtime use Cognito JWT authentication. IAM roles grant the deployed services their AWS permissions.
 
 ## Repository structure
 
-```text
+```code
 .
 â”œâ”€â”€ README.md
 â”œâ”€â”€ agentcore_chat.py                 # Local terminal client (actual filename)
