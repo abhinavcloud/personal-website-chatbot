@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Sign in with Google through Cognito, then chat with deployed AgentCore Runtime.
 
-Set DEFAULT_COGNITO_APP_CLIENT_ID below, then run: python agentcore_chat.py
-Alternatively use --cognito-client-id or COGNITO_APP_CLIENT_ID. Override the login domain with
---cognito-domain or COGNITO_DOMAIN if it differs from the default below.
+Configure the .env file beside this script, then run: python agentcore_chat.py
+See .env.example for the required settings. Existing environment variables override
+.env values, and command-line arguments override both.
 
 A temporary localhost listener receives the OAuth callback; the agent runs
 entirely in AWS. Login uses PKCE and keeps tokens in memory only. Run again
@@ -11,7 +11,7 @@ to sign in after expiry, using --session-id to resume the conversation.
 The runtime derives the user identity from the token; this client reuses a
 separate conversation ID and sends only the latest prompt on each turn.
 
-Requires: httpx (python -m pip install httpx).
+Requires: python -m pip install -r requirements-chat.txt
 """
 
 import argparse
@@ -25,25 +25,10 @@ import time
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 import httpx
-
-
-# -----------------------------------------------------------------------------
-# Edit these so you can just run `python agentcore_chat.py` with no flags.
-# Paste your two Terraform outputs here EXACTLY as Terraform prints them --
-# no manual editing needed, the endpoint name is extracted automatically
-# from the endpoint ARN below.
-# -----------------------------------------------------------------------------
-DEFAULT_AGENT_RUNTIME_ARN = "arn:aws:bedrock-agentcore:ap-south-1:806685982094:runtime/agentcore_runtime-drBxRq7FwE"
-DEFAULT_AGENT_RUNTIME_ENDPOINT_ARN = "arn:aws:bedrock-agentcore:ap-south-1:806685982094:runtime/agentcore_runtime-drBxRq7FwE/runtime-endpoint/agentcore_runtime_endpoint"
-
-# qualifier = just the trailing name segment of the endpoint ARN, e.g.
-# ".../runtime-endpoint/agentcore_runtime_endpoint" -> "agentcore_runtime_endpoint"
-DEFAULT_QUALIFIER = DEFAULT_AGENT_RUNTIME_ENDPOINT_ARN.rsplit("/", 1)[-1]
-DEFAULT_COGNITO_DOMAIN = "https://abhinav-agent-auth.auth.ap-south-1.amazoncognito.com"
-DEFAULT_COGNITO_APP_CLIENT_ID = "n9jes0narf56ptp1t3ccmhvev"  # Paste the Cognito app client ID here, not the Google client ID.
-DEFAULT_CALLBACK_URL = "http://localhost:3000/callback.html"
+from dotenv import load_dotenv
 
 
 def build_session_id() -> str:
@@ -173,20 +158,22 @@ def login_with_google(domain: str, client_id: str, callback_url: str,
 
 
 def main() -> None:
+    load_dotenv(Path(__file__).resolve().with_name(".env"), override=False)
+    endpoint_arn = os.getenv("AGENT_RUNTIME_ENDPOINT_ARN", "")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cognito-client-id", default=os.getenv("COGNITO_APP_CLIENT_ID", DEFAULT_COGNITO_APP_CLIENT_ID),
+    parser.add_argument("--cognito-client-id", default=os.getenv("COGNITO_APP_CLIENT_ID"),
                         help="Cognito app client ID (not the Google OAuth client ID)")
-    parser.add_argument("--cognito-domain", default=os.getenv("COGNITO_DOMAIN", DEFAULT_COGNITO_DOMAIN))
-    parser.add_argument("--callback-url", default=os.getenv("COGNITO_CALLBACK_URL", DEFAULT_CALLBACK_URL),
+    parser.add_argument("--cognito-domain", default=os.getenv("COGNITO_DOMAIN"))
+    parser.add_argument("--callback-url", default=os.getenv("COGNITO_CALLBACK_URL"),
                         help="Exact callback URL registered on the Cognito app client")
     parser.add_argument(
         "--agent-runtime-arn",
-        default=os.environ.get("AGENT_RUNTIME_ARN", DEFAULT_AGENT_RUNTIME_ARN),
+        default=os.getenv("AGENT_RUNTIME_ARN"),
         help="ARN of the aws_bedrockagentcore_agent_runtime (the RUNTIME, not the endpoint)",
     )
     parser.add_argument(
         "--qualifier",
-        default=os.environ.get("AGENT_ENDPOINT_QUALIFIER", DEFAULT_QUALIFIER),
+        default=os.getenv("AGENT_ENDPOINT_QUALIFIER", endpoint_arn.rsplit("/", 1)[-1]),
         help="Endpoint name (aws_bedrockagentcore_agent_runtime_endpoint). "
              "Pass '' or 'DEFAULT' to use the runtime's auto-created default endpoint instead.",
     )
@@ -196,8 +183,14 @@ def main() -> None:
                               "Defaults to a new random session.")
     args = parser.parse_args()
 
-    if not args.cognito_client_id:
-        parser.error("Set DEFAULT_COGNITO_APP_CLIENT_ID, --cognito-client-id, or COGNITO_APP_CLIENT_ID to your Cognito app client ID")
+    for attribute, variable, flag in (
+        ("cognito_client_id", "COGNITO_APP_CLIENT_ID", "--cognito-client-id"),
+        ("cognito_domain", "COGNITO_DOMAIN", "--cognito-domain"),
+        ("callback_url", "COGNITO_CALLBACK_URL", "--callback-url"),
+        ("agent_runtime_arn", "AGENT_RUNTIME_ARN", "--agent-runtime-arn"),
+    ):
+        if not (getattr(args, attribute) or "").strip():
+            parser.error(f"Set {variable} in .env or the environment, or pass {flag}")
     if not re.fullmatch(r"arn:aws:bedrock-agentcore:[a-z0-9-]+:\d{12}:runtime/[A-Za-z0-9_-]+",
                         args.agent_runtime_arn):
         parser.error("Provide a valid AgentCore runtime ARN")
